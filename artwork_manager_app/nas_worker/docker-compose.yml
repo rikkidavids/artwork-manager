@@ -1,0 +1,23 @@
+services:
+  artwork-manager-worker:
+    # The explicit image tag makes it obvious which worker build Synology should be running.
+    # Important: after copying new files to the NAS, rebuild the project/image. A restart alone
+    # can keep serving an older cached image.
+    image: artwork-manager-worker:4.53
+    build:
+      context: .
+    container_name: artwork-manager-worker
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      # Change this to a private value, then paste the same token into the Mac app Settings.
+      AMW_TOKEN: "change-me"
+      AMW_MUSIC_ROOT: "/music"
+      AMW_BACKUP_DIR: "/backups"
+      AMW_RECENT_JOBS: "50"
+    volumes:
+      # Rikki's Synology music path. Change the left side if your music lives elsewhere.
+      - "/volume2/data/media/music:/music:rw"
+      # Keeps backups beside this Docker project folder, so it is portable across Synology volumes.
+      - "./backups:/backups:rw"
