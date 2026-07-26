@@ -4,7 +4,7 @@ import os
 import shutil
 
 APP_NAME = 'Artwork Review Manager'
-BUILD_VERSION = 'Build 4.53 — Unicode-safe NAS paths'
+BUILD_VERSION = 'Build 4.54 — Faster NAS scans'
 MIN_ARTWORK_SIZE = 1000
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
@@ -107,6 +107,9 @@ DEFAULT_SETTINGS = {
     # Optional slower scan mode: inspect every supported file in each album
     # against the user's preferred target size and baseline-JPEG rules.
     'deep_scan_all_files': False,
+    # Per-album scan checks are I/O bound, especially on NAS/SMB shares. A
+    # modest thread pool hides network latency without overwhelming the share.
+    'scan_worker_threads': 8,
     # Optional NAS/Synology Docker worker. When enabled and a path mapping matches,
     # heavy write/check jobs run on the NAS instead of over SMB/VPN.
     'nas_worker_enabled': False,
@@ -212,6 +215,11 @@ def get_deep_scan_all_files(settings=None):
     return bool(settings.get('deep_scan_all_files', False))
 
 
+def get_scan_worker_threads(settings=None):
+    settings = settings or load_settings()
+    return _settings_int(settings, 'scan_worker_threads', 8, minimum=1, maximum=32)
+
+
 def get_nas_worker_enabled(settings=None):
     settings = settings or load_settings()
     return bool(settings.get('nas_worker_enabled', False))
@@ -243,4 +251,3 @@ def get_max_embedded_artwork_size(settings=None):
     # Backwards-compatible name retained for older code paths. It now returns
     # the user's approved-artwork target size rather than a separate maximum.
     return get_approved_artwork_target_size(settings)
-
