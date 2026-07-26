@@ -5,7 +5,7 @@ from urllib.parse import quote
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from PIL import Image, ImageTk, ImageFilter, ImageOps
-from .config import APP_DIR, BUILD_VERSION, MIN_ARTWORK_SIZE, APPROVED_DIR, REPORT_DIR, BACKUP_DIR, PREVIEW_CACHE_DIR, TEMP_DIR, IMPORT_DIR, DATA_DIR, DB_PATH, load_settings, save_settings, get_scan_min_artwork_size, get_fetch_min_artwork_size, get_preferred_artwork_size, get_target_size_match_mode, get_deep_scan_all_files, get_max_candidates_per_album, get_batch_search_count, get_max_embedded_artwork_size, get_nas_worker_enabled
+from .config import APP_DIR, BUILD_VERSION, MIN_ARTWORK_SIZE, APPROVED_DIR, REPORT_DIR, BACKUP_DIR, PREVIEW_CACHE_DIR, TEMP_DIR, IMPORT_DIR, DATA_DIR, DB_PATH, load_settings, save_settings, get_scan_min_artwork_size, get_fetch_min_artwork_size, get_preferred_artwork_size, get_target_size_match_mode, get_deep_scan_all_files, get_scan_worker_threads, get_max_candidates_per_album, get_batch_search_count, get_max_embedded_artwork_size, get_nas_worker_enabled
 from .utils import clean_input_path, open_path, normalize_for_match, clean_album_name, artwork_meets_target_size, prepare_jpeg_bytes, image_dimensions_from_bytes
 from .scanner import scan_library, write_low_res_csv, count_album_folders, embedded_artwork, inspect_album_identity, analyze_album_folder, _album_folder_cover_status, deep_check_album_problem_files, _deep_check_album_files
 from .review_queue import build_candidates, google_images_url, manual_import
@@ -187,6 +187,7 @@ class SettingsWindow(tk.Toplevel):
         self.preferred_size_var = tk.StringVar(value=str(get_preferred_artwork_size(self.settings)))
         self.target_size_mode_var = tk.StringVar(value=get_target_size_match_mode(self.settings))
         self.deep_scan_all_files = tk.BooleanVar(value=get_deep_scan_all_files(self.settings))
+        self.scan_worker_threads_var = tk.StringVar(value=str(get_scan_worker_threads(self.settings)))
         self.max_candidates_var = tk.StringVar(value=str(get_max_candidates_per_album(self.settings)))
         self.batch_count_var = tk.StringVar(value=str(get_batch_search_count(self.settings)))
         self.save_album_artwork_file = tk.BooleanVar(value=bool(self.settings.get('save_approved_artwork_to_album_folder', False)))
@@ -285,8 +286,9 @@ class SettingsWindow(tk.Toplevel):
             foreground='gray', wraplength=420,
         ).grid(row=9, column=0, columnspan=2, sticky='w', pady=(0, 6))
 
-        add_setting(10, 'Max options saved per album:', self.max_candidates_var, 'Limits how many artwork candidates a single Find Artwork run saves per album.')
-        add_setting(12, 'Batch search count:', self.batch_count_var, 'How many albums are searched by the Search Next N Albums button.')
+        add_setting(10, 'Scan album checks at once:', self.scan_worker_threads_var, 'How many album folders can be inspected in parallel during Scan / Resume. For most NAS shares, 4–12 is the useful range.')
+        add_setting(12, 'Max options saved per album:', self.max_candidates_var, 'Limits how many artwork candidates a single Find Artwork run saves per album.')
+        add_setting(14, 'Batch search count:', self.batch_count_var, 'How many albums are searched by the Search Next N Albums button.')
 
         ttk.Label(
             body,
@@ -603,6 +605,7 @@ class SettingsWindow(tk.Toplevel):
         preferred = self._int_value(self.preferred_size_var, 'Preferred size', 1, 10000)
         max_candidates = self._int_value(self.max_candidates_var, 'Max options per album', 1, 25)
         batch_count = self._int_value(self.batch_count_var, 'Batch search count', 1, 50)
+        scan_worker_threads = self._int_value(self.scan_worker_threads_var, 'Scan album checks at once', 1, 32)
         nas_timeout = self._int_value(self.nas_worker_timeout, 'NAS worker timeout', 5, 7200)
         return {
             'discogs_token': self.discogs_token.get().strip(),
@@ -617,6 +620,7 @@ class SettingsWindow(tk.Toplevel):
             'preferred_artwork_size': preferred,
             'target_size_match_mode': self.target_size_mode_var.get() if self.target_size_mode_var.get() in ('Relaxed', 'Strict') else 'Relaxed',
             'deep_scan_all_files': self.deep_scan_all_files.get(),
+            'scan_worker_threads': scan_worker_threads,
             'max_candidates_per_album': max_candidates,
             'batch_search_count': batch_count,
             'save_approved_artwork_to_album_folder': self.save_album_artwork_file.get(),
