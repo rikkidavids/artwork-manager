@@ -1,11 +1,12 @@
-import os, csv, re
+import os, csv, re, hashlib
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter
 from datetime import datetime
 from mutagen import File as MutagenFile
 from mutagen.id3 import ID3
 from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
-from .config import MUSIC_EXTENSIONS, REPORT_DIR, get_scan_min_artwork_size, get_preferred_artwork_size, get_deep_scan_all_files, load_settings
+from .config import MUSIC_EXTENSIONS, REPORT_DIR, get_scan_min_artwork_size, get_preferred_artwork_size, get_deep_scan_all_files, get_scan_worker_threads, load_settings
 from .utils import image_dimensions_from_bytes, image_dimensions, normalize_for_match, clean_album_name, artwork_compatibility_from_bytes, artwork_compatibility_from_path, artwork_meets_target_size
 from .state import evaluate_album_state, status_reason_note
 from . import database as db
@@ -25,6 +26,70 @@ def _sort_names(names):
         return sorted(list(names), key=_alpha_key)
     except Exception:
         return list(names)
+
+
+def _path_resume_key(path):
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(str(path or ''))))
+    except Exception:
+        return str(path or '')
+
+
+def _same_path(a, b):
+    return bool(a and b and _path_resume_key(a) == _path_resume_key(b))
+
+
+def _folder_music_fingerprint(root, music):
+    """Build a cheap change detector for an album folder.
+
+    Mutagen tag/artwork parsing is the expensive NAS operation. This fingerprint
+    uses only file names, sizes, and mtimes so future resume scans can skip
+    unchanged folders while still catching common edits/replacements.
+    """
+    parts = []
+    total_size = 0
+    max_mtime_ns = 0
+    for name in _sort_names(music or []):
+        try:
+            st = os.stat(os.path.join(root, name))
+            size = int(getattr(st, 'st_size', 0) or 0)
+            mtime_ns = int(getattr(st, 'st_mtime_ns', int(getattr(st, 'st_mtime', 0) * 1000000000)) or 0)
+        except Exception:
+            size = -1
+            mtime_ns = -1
+        total_size += max(0, size)
+        max_mtime_ns = max(max_mtime_ns, mtime_ns)
+        parts.append(f'{name}\0{size}\0{mtime_ns}')
+    digest = hashlib.sha1('\0'.join(parts).encode('utf-8', errors='ignore')).hexdigest()
+    return {
+        'version': 1,
+        'file_count': len(music or []),
+        'total_size': total_size,
+        'max_mtime_ns': max_mtime_ns,
+        'digest': digest,
+    }
+
+
+def _fingerprint_matches(saved, current):
+    if not isinstance(saved, dict) or not isinstance(current, dict):
+        return False
+    return (
+        int(saved.get('version') or 0) == int(current.get('version') or 0) and
+        int(saved.get('file_count') or -1) == int(current.get('file_count') or -2) and
+        int(saved.get('total_size') or -1) == int(current.get('total_size') or -2) and
+        int(saved.get('max_mtime_ns') or -1) == int(current.get('max_mtime_ns') or -2) and
+        str(saved.get('digest') or '') == str(current.get('digest') or '')
+    )
+
+
+def _identity_with_scan_fingerprint(identity, scan_fingerprint):
+    if not scan_fingerprint:
+        return identity
+    out = dict(identity or {})
+    notes = dict(out.get('notes') or {})
+    notes['scan_fingerprint'] = scan_fingerprint
+    out['notes'] = notes
+    return out
 
 
 def _as_text_list(value):
@@ -296,7 +361,7 @@ def embedded_artwork(path):
     return out
 
 
-def _album_folder_cover_status(album_path, target_size=None):
+def _album_folder_cover_status(album_path, target_size=None, folder_files=None):
     """Check whether a player-friendly cover.jpg exists in the album folder.
 
     When the user has enabled album-folder artwork copies, scans should also
@@ -307,15 +372,18 @@ def _album_folder_cover_status(album_path, target_size=None):
     """
     target_size = int(target_size or get_preferred_artwork_size())
     folder = album_path or ''
-    if not folder or not os.path.isdir(folder):
+    if not folder:
         return {'ok': False, 'issue': 'album folder unavailable', 'path': ''}
-    candidates = [
-        os.path.join(folder, 'cover.jpg'),
-        os.path.join(folder, 'cover.jpeg'),
-        os.path.join(folder, 'cover.png'),
-        os.path.join(folder, 'cover.webp'),
-    ]
-    existing = next((p for p in candidates if os.path.isfile(p)), '')
+    candidate_names = ('cover.jpg', 'cover.jpeg', 'cover.png', 'cover.webp')
+    if folder_files is not None:
+        by_lower = {str(n).lower(): str(n) for n in folder_files}
+        existing_name = next((by_lower.get(name) for name in candidate_names if by_lower.get(name)), '')
+        existing = os.path.join(folder, existing_name) if existing_name else ''
+    else:
+        if not os.path.isdir(folder):
+            return {'ok': False, 'issue': 'album folder unavailable', 'path': ''}
+        candidates = [os.path.join(folder, name) for name in candidate_names]
+        existing = next((p for p in candidates if os.path.isfile(p)), '')
     if not existing:
         return {'ok': False, 'issue': 'folder cover missing', 'path': ''}
     dims = image_dimensions(existing)
@@ -525,7 +593,7 @@ def _deep_check_summary(check):
     return '; '.join(bits) or f'{checked} file(s) OK'
 
 
-def analyze_album_folder(root, library_root, include_missing=True, music_files=None, identity=None, min_artwork_size=None, force_deep_check=False):
+def analyze_album_folder(root, library_root, include_missing=True, music_files=None, identity=None, min_artwork_size=None, force_deep_check=False, folder_files=None, scan_fingerprint=None):
     """Inspect one album folder and return a queue row if artwork needs action.
 
     `scan_library` passes the file list and identity it has already computed,
@@ -550,6 +618,7 @@ def analyze_album_folder(root, library_root, include_missing=True, music_files=N
     deep_check_enabled = bool(force_deep_check or get_deep_scan_all_files(settings))
     min_artwork_size = int(min_artwork_size or (get_preferred_artwork_size(settings) if deep_check_enabled else get_scan_min_artwork_size(settings)))
     identity = identity or inspect_album_identity(root, library_root, music)
+    identity = _identity_with_scan_fingerprint(identity, scan_fingerprint)
     artist = identity['artist']
     album = identity['album']
     album_path = get_album_path(root, library_root)
@@ -618,7 +687,8 @@ def analyze_album_folder(root, library_root, include_missing=True, music_files=N
             if album_low or album_not_square or album_incompatible:
                 break
     if settings.get('save_approved_artwork_to_album_folder', False):
-        folder_cover_status = _album_folder_cover_status(album_path, get_preferred_artwork_size(settings))
+        cover_files = folder_files if _same_path(root, album_path) else None
+        folder_cover_status = _album_folder_cover_status(album_path, get_preferred_artwork_size(settings), folder_files=cover_files)
         if not folder_cover_status.get('ok'):
             album_incompatible = True
             folder_cover_issue = folder_cover_status.get('issue') or 'folder cover missing'
@@ -705,6 +775,7 @@ def count_album_folders(library_root, stop_event=None):
 def scan_library(library_root, include_missing=True, progress=None, stop_event=None, on_album=None, total_albums=None, resume=True):
     rows = []
     seen_keys = set()
+    submitted_paths = set()
     processed_music = 0
     try:
         scan_settings = load_settings()
@@ -715,42 +786,32 @@ def scan_library(library_root, include_missing=True, progress=None, stop_event=N
     # setting on would leave old rows based on the faster scan. Normal
     # Scan/Resume keeps its quick incremental behaviour.
     known_keys = db.existing_album_keys() if (resume and not deep_check_enabled) else set()
+    resume_info = db.existing_album_resume_info() if (resume and not deep_check_enabled) else {}
     last_db_progress = 0
     min_artwork_size = get_preferred_artwork_size(scan_settings) if deep_check_enabled else get_scan_min_artwork_size(scan_settings)
+    max_workers = get_scan_worker_threads(scan_settings)
+    if deep_check_enabled:
+        max_workers = min(max_workers, 8)
+    max_pending = max(1, max_workers * 3)
 
-    for root, dirs, files in os.walk(library_root):
-        dirs[:] = _sort_names(dirs)
-        files = _sort_names(files)
-        if stop_event and stop_event.is_set():
-            break
-        music = [n for n in files if n.lower().endswith(MUSIC_EXTENSIONS)]
-        if not music:
-            continue
-
-        processed_music += 1
-        if progress:
-            progress(processed_music, total_albums, root)
-
-        identity = inspect_album_identity(root, library_root, music)
-        artist = identity['artist']
-        album = identity['album']
-        album_path = get_album_path(root, library_root)
-        key = album_key(artist, album, album_path)
-
-        if resume and key in known_keys:
+    def finish_future(fut):
+        nonlocal last_db_progress
+        result = fut.result()
+        if not result or result.get('skipped'):
             if processed_music - last_db_progress >= 25:
                 db.update_scan_progress(processed_music, total_albums)
                 last_db_progress = processed_music
-            continue
-
-        row = analyze_album_folder(root, library_root, include_missing=include_missing, music_files=music, identity=identity, min_artwork_size=min_artwork_size)
+            return
+        row = result.get('row')
+        key = result.get('album_key')
+        identity = result.get('identity') or {}
         if not row:
-            known_keys.add(key)
+            if key:
+                known_keys.add(key)
             if processed_music - last_db_progress >= 25:
                 db.update_scan_progress(processed_music, total_albums)
                 last_db_progress = processed_music
-            continue
-
+            return
         artist, album, w, h, example, album_path, key, identity = row
         if key not in seen_keys:
             rows.append(row)
@@ -783,8 +844,6 @@ def scan_library(library_root, include_missing=True, progress=None, stop_event=N
                             height=height_value,
                             example_file=example,
                             meta=identity)
-            db.update_scan_progress(processed_music, total_albums)
-            last_db_progress = processed_music
             info = {
                 'artist': artist,
                 'album': album,
@@ -800,6 +859,81 @@ def scan_library(library_root, include_missing=True, progress=None, stop_event=N
             }
             if on_album:
                 on_album(row, info, len(rows))
+        if processed_music - last_db_progress >= 25:
+            db.update_scan_progress(processed_music, total_albums)
+            last_db_progress = processed_music
+
+    def scan_album_job(root, files, music, album_path, fingerprint, allow_key_resume_skip=True):
+        identity = inspect_album_identity(root, library_root, music)
+        artist = identity['artist']
+        album = identity['album']
+        key = album_key(artist, album, album_path)
+        if allow_key_resume_skip and resume and key in known_keys:
+            return {'skipped': True, 'album_key': key}
+        row = analyze_album_folder(
+            root,
+            library_root,
+            include_missing=include_missing,
+            music_files=music,
+            identity=identity,
+            min_artwork_size=min_artwork_size,
+            folder_files=files,
+            scan_fingerprint=fingerprint,
+        )
+        return {'row': row, 'album_key': key, 'identity': identity}
+
+    pending = set()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for root, dirs, files in os.walk(library_root):
+            dirs[:] = _sort_names(dirs)
+            files = _sort_names(files)
+            if stop_event and stop_event.is_set():
+                break
+            music = [n for n in files if n.lower().endswith(MUSIC_EXTENSIONS)]
+            if not music:
+                continue
+
+            processed_music += 1
+            if progress:
+                progress(processed_music, total_albums, root)
+
+            album_path = get_album_path(root, library_root)
+            album_path_key = _path_resume_key(album_path)
+            if album_path_key in submitted_paths:
+                continue
+            submitted_paths.add(album_path_key)
+
+            existing = resume_info.get(album_path) or resume_info.get(album_path_key)
+            fingerprint = None
+            allow_key_resume_skip = True
+            if existing:
+                saved_fingerprint = existing.get('scan_fingerprint')
+                if saved_fingerprint:
+                    fingerprint = _folder_music_fingerprint(root, music)
+                    if _fingerprint_matches(saved_fingerprint, fingerprint):
+                        if processed_music - last_db_progress >= 25:
+                            db.update_scan_progress(processed_music, total_albums)
+                            last_db_progress = processed_music
+                        continue
+                    allow_key_resume_skip = False
+                else:
+                    if processed_music - last_db_progress >= 25:
+                        db.update_scan_progress(processed_music, total_albums)
+                        last_db_progress = processed_music
+                    continue
+            if fingerprint is None:
+                fingerprint = _folder_music_fingerprint(root, music)
+
+            pending.add(executor.submit(scan_album_job, root, files, music, album_path, fingerprint, allow_key_resume_skip))
+            if len(pending) >= max_pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    finish_future(fut)
+
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                finish_future(fut)
 
     db.update_scan_progress(processed_music, total_albums)
     return rows, {}
