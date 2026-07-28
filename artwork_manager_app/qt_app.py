@@ -14,8 +14,8 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QSize, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPen, QPixmap
+from PySide6.QtCore import QRectF, QSize, Qt, QThread, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -35,7 +35,6 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStatusBar,
-    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -54,6 +53,15 @@ from .utils import open_path
 
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 FILTERS = ('All', 'Needs Attention', 'Review', 'Missing', 'Needs Search', 'Not Square', 'Convert', 'Good', 'Handled')
+BUCKET_COLORS = {
+    'Review': ('#17345c', '#e7f0ff'),
+    'Missing': ('#5c3217', '#fff0df'),
+    'Needs Search': ('#514017', '#fff7d6'),
+    'Not Square': ('#5b2345', '#fde8f2'),
+    'Convert': ('#3b2f67', '#eee9ff'),
+    'Good': ('#174c33', '#e4f7ed'),
+    'Handled': ('#46505d', '#edf0f5'),
+}
 
 
 def _text(value: Any, fallback: str = '') -> str:
@@ -101,6 +109,53 @@ def configure_app_font(app: QApplication) -> None:
     font = QFont('Helvetica Neue')
     font.setPointSize(13)
     app.setFont(font)
+
+
+def _line_icon(kind: str, color: str = '#4b5563') -> QIcon:
+    pix = QPixmap(20, 20)
+    pix.fill(Qt.transparent)
+    painter = QPainter(pix)
+    painter.setRenderHint(QPainter.Antialiasing)
+    pen = QPen(QColor(color))
+    pen.setWidthF(1.8)
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.NoBrush)
+    if kind == 'refresh':
+        painter.drawLine(5, 7, 14, 7)
+        painter.drawLine(14, 7, 11, 4)
+        painter.drawLine(14, 7, 11, 10)
+        painter.drawLine(15, 13, 6, 13)
+        painter.drawLine(6, 13, 9, 10)
+        painter.drawLine(6, 13, 9, 16)
+    elif kind == 'app':
+        painter.drawRoundedRect(QRectF(3.5, 4.5, 13, 10), 2, 2)
+        painter.drawLine(8, 16, 12, 16)
+        painter.drawLine(10, 14.5, 10, 16)
+    elif kind == 'search':
+        painter.drawEllipse(QRectF(4, 4, 8.5, 8.5))
+        painter.drawLine(11, 11, 16, 16)
+    elif kind == 'stop':
+        painter.drawLine(5, 5, 15, 15)
+        painter.drawLine(15, 5, 5, 15)
+    elif kind == 'check':
+        painter.drawLine(4.5, 10.5, 8.5, 14.5)
+        painter.drawLine(8.5, 14.5, 16, 5.5)
+    elif kind == 'folder':
+        painter.drawLine(3.5, 7, 7.5, 7)
+        painter.drawLine(7.5, 7, 9.5, 9)
+        painter.drawLine(9.5, 9, 16.5, 9)
+        painter.drawLine(16.5, 9, 16.5, 15)
+        painter.drawLine(16.5, 15, 3.5, 15)
+        painter.drawLine(3.5, 15, 3.5, 7)
+    elif kind == 'link':
+        painter.drawRoundedRect(QRectF(4, 6, 10, 10), 2, 2)
+        painter.drawLine(10, 4, 16, 4)
+        painter.drawLine(16, 4, 16, 10)
+        painter.drawLine(16, 4, 10, 10)
+    painter.end()
+    return QIcon(pix)
 
 
 def _first_music_file(album: Dict[str, Any]) -> str:
@@ -326,14 +381,13 @@ class QtArtworkWindow(QMainWindow):
         toolbar.setIconSize(QSize(16, 16))
         toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
-        style = self.style()
 
-        refresh = QAction(style.standardIcon(QStyle.SP_BrowserReload), 'Refresh', self)
+        refresh = QAction(_line_icon('refresh'), 'Refresh', self)
         refresh.setToolTip('Reload the queue from the database')
         refresh.triggered.connect(lambda: self.reload_queue(select_first=False))
         toolbar.addAction(refresh)
 
-        open_tk = QAction(style.standardIcon(QStyle.SP_ComputerIcon), 'Open Stable Tk App', self)
+        open_tk = QAction(_line_icon('app'), 'Open Stable Tk App', self)
         open_tk.setToolTip('Show where write actions still live')
         open_tk.triggered.connect(self._show_tk_hint)
         toolbar.addAction(open_tk)
@@ -398,7 +452,11 @@ class QtArtworkWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setCornerButtonEnabled(False)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(31)
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -434,15 +492,18 @@ class QtArtworkWindow(QMainWindow):
         layout.addLayout(image_grid, 3)
 
         lower = QSplitter(Qt.Horizontal)
+        lower.setObjectName('reviewSplitter')
         lower.setChildrenCollapsible(False)
         self.candidate_list = QListWidget()
         self.candidate_list.setObjectName('candidateList')
+        self.candidate_list.setSpacing(2)
         self.candidate_list.currentRowChanged.connect(self._select_candidate)
         lower.addWidget(self.candidate_list)
 
         self.details = QTextEdit()
         self.details.setReadOnly(True)
         self.details.setObjectName('detailsText')
+        self.details.setLineWrapMode(QTextEdit.WidgetWidth)
         lower.addWidget(self.details)
         lower.setSizes([320, 560])
         layout.addWidget(lower, 2)
@@ -459,20 +520,23 @@ class QtArtworkWindow(QMainWindow):
 
         actions = QHBoxLayout()
         self.find_btn = QPushButton('Find Artwork')
-        self.find_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogContentsView))
+        self.find_btn.setObjectName('primaryButton')
+        self.find_btn.setIcon(_line_icon('search', '#ffffff'))
         self.find_btn.setIconSize(QSize(16, 16))
         self.find_btn.clicked.connect(self.find_artwork_for_selected_album)
         actions.addWidget(self.find_btn)
 
         self.stop_search_btn = QPushButton('Stop')
-        self.stop_search_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserStop))
+        self.stop_search_btn.setObjectName('dangerButton')
+        self.stop_search_btn.setIcon(_line_icon('stop', '#ffffff'))
         self.stop_search_btn.setIconSize(QSize(16, 16))
         self.stop_search_btn.clicked.connect(self.stop_search)
         self.stop_search_btn.setVisible(False)
         actions.addWidget(self.stop_search_btn)
 
         self.approve_btn = QPushButton('Approve + Embed')
-        self.approve_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
+        self.approve_btn.setObjectName('approveButton')
+        self.approve_btn.setIcon(_line_icon('check', '#ffffff'))
         self.approve_btn.setIconSize(QSize(16, 16))
         self.approve_btn.clicked.connect(self.approve_selected_candidate)
         actions.addWidget(self.approve_btn)
@@ -484,11 +548,13 @@ class QtArtworkWindow(QMainWindow):
         actions.addWidget(self.backup_checkbox)
 
         self.open_folder_btn = QPushButton('Open Album Folder')
-        self.open_folder_btn.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        self.open_folder_btn.setObjectName('quietButton')
+        self.open_folder_btn.setIcon(_line_icon('folder'))
         self.open_folder_btn.setIconSize(QSize(16, 16))
         self.open_folder_btn.clicked.connect(self.open_album_folder)
         self.open_source_btn = QPushButton('Open Source Page')
-        self.open_source_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.open_source_btn.setObjectName('quietButton')
+        self.open_source_btn.setIcon(_line_icon('link'))
         self.open_source_btn.setIconSize(QSize(16, 16))
         self.open_source_btn.clicked.connect(self.open_source_page)
         actions.addWidget(self.open_folder_btn)
@@ -568,6 +634,11 @@ class QtArtworkWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 if col in (3, 4):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if col == 0:
+                    fg, bg = BUCKET_COLORS.get(bucket, ('#46505d', '#edf0f5'))
+                    item.setForeground(QBrush(QColor(fg)))
+                    item.setBackground(QBrush(QColor(bg)))
+                    item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(row, col, item)
         self.table.blockSignals(False)
         self.count_label.setText(f'{len(self.visible_albums)} shown')
@@ -639,6 +710,7 @@ class QtArtworkWindow(QMainWindow):
             label = self._candidate_label(cand)
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, cand)
+            item.setSizeHint(QSize(0, 58))
             self.candidate_list.addItem(item)
         if self.current_candidates:
             self.candidate_list.setCurrentRow(0)
@@ -1000,6 +1072,16 @@ class QtArtworkWindow(QMainWindow):
                 spacing: 8px;
                 padding: 6px;
             }
+            QToolButton {
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 6px;
+                padding: 5px 8px;
+            }
+            QToolButton:hover {
+                background: #eef2f7;
+                border-color: #dde3ec;
+            }
             QLabel#readonlyPill {
                 color: #4f5f74;
                 background: #e8eef7;
@@ -1072,7 +1154,22 @@ class QtArtworkWindow(QMainWindow):
                 selection-color: #111827;
             }
             QTableWidget {
-                gridline-color: #ececf1;
+                gridline-color: transparent;
+                alternate-background-color: #fbfbfd;
+            }
+            QTableWidget::item, QListWidget::item {
+                padding: 6px;
+                border-bottom: 1px solid #eef0f4;
+            }
+            QTableWidget::item:selected, QListWidget::item:selected {
+                background: #dbeafe;
+                color: #111827;
+            }
+            QListWidget::item:hover {
+                background: #f1f5fb;
+            }
+            QTextEdit#detailsText {
+                line-height: 1.35;
             }
             QHeaderView::section {
                 background: #f1f2f5;
@@ -1091,9 +1188,65 @@ class QtArtworkWindow(QMainWindow):
                 background: #f0f4ff;
                 border-color: #a9b8d8;
             }
+            QPushButton#primaryButton {
+                color: #ffffff;
+                background: #2563eb;
+                border-color: #1d4ed8;
+                font-weight: 700;
+            }
+            QPushButton#primaryButton:hover {
+                background: #1d4ed8;
+                border-color: #1e40af;
+            }
+            QPushButton#approveButton {
+                color: #ffffff;
+                background: #16834a;
+                border-color: #126b3d;
+                font-weight: 700;
+            }
+            QPushButton#approveButton:hover {
+                background: #126b3d;
+                border-color: #0f5b34;
+            }
+            QPushButton#dangerButton {
+                color: #ffffff;
+                background: #dc2626;
+                border-color: #b91c1c;
+                font-weight: 700;
+            }
+            QPushButton#dangerButton:hover {
+                background: #b91c1c;
+                border-color: #991b1b;
+            }
+            QPushButton#quietButton {
+                background: #fbfbfd;
+            }
             QPushButton:disabled {
                 color: #9a9aa2;
                 background: #f4f4f6;
+                border-color: #d9d9df;
+            }
+            QCheckBox {
+                spacing: 8px;
+                color: #343a46;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                border: 1px solid #b8bfca;
+                background: #ffffff;
+            }
+            QCheckBox::indicator:hover {
+                border-color: #8aa4d6;
+            }
+            QCheckBox::indicator:checked {
+                background: #2563eb;
+                border-color: #2563eb;
+            }
+            QCheckBox::indicator:checked:disabled {
+                background: #9ca3af;
+                border-color: #9ca3af;
             }
             QProgressBar {
                 background: #e9e9ef;
@@ -1145,6 +1298,12 @@ class QtArtworkWindow(QMainWindow):
             }
             QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
                 background: transparent;
+            }
+            QSplitter::handle {
+                background: transparent;
+            }
+            QSplitter::handle:hover {
+                background: #e4e9f2;
             }
             """
         )

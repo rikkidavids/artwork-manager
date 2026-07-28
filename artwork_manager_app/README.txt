@@ -1,4 +1,4 @@
-Build 4.58 — Qt control polish
+Build 4.59 — Qt action polish
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -8,6 +8,7 @@ Build 4.58 — Qt control polish
 - Removed generated Python bytecode files from version control.
 - The Qt prototype now supports Find Artwork and Approve + Embed for saved artwork candidates, with progress, optional backups, and post-embed verification.
 - Polished the Qt filter dropdown and scrollbars so the modern UI does not fall back to chunky default controls.
+- Replaced old stock action icons with custom line icons, added clearer button hierarchy, and softened the queue/candidate list styling.
 
 Qt prototype branch
 
