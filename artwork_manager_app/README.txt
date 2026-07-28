@@ -1,4 +1,4 @@
-Build 4.61 — Qt queue workflow polish
+Build 4.62 — Qt layout stability polish
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -11,6 +11,8 @@ Build 4.61 — Qt queue workflow polish
 - Replaced old stock action icons with custom line icons, added clearer button hierarchy, and softened the queue/candidate list styling.
 - Cleaned label backgrounds in the queue header and added draggable, remembered album-list column widths with a roomier Qt split.
 - After a successful Qt approve/embed, the review pane advances to the next actionable queue item.
+- Long selected album names now truncate instead of pushing the queue/artwork layout around.
+- The Qt queue/review divider is remembered, and Backup before embed moved out of the bottom action row.
 
 Qt prototype branch
 

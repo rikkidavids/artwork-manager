@@ -4,7 +4,7 @@ import os
 import shutil
 
 APP_NAME = 'Artwork Review Manager'
-BUILD_VERSION = 'Build 4.61 — Qt queue workflow polish'
+BUILD_VERSION = 'Build 4.62 — Qt layout stability polish'
 MIN_ARTWORK_SIZE = 1000
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
@@ -126,6 +126,7 @@ DEFAULT_SETTINGS = {
         'geometry': '',
         'queue_filter': 'All',
         'queue_columns': {},
+        'qt_main_splitter': [],
         'right_panel_w': 0,
         'queue_search': '',
         # Main work-list position: True puts the queue on the left and review pane on the right.

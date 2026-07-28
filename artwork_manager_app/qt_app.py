@@ -340,6 +340,40 @@ class ImagePanel(QFrame):
         super().resizeEvent(event)
 
 
+class ElidedLabel(QLabel):
+    def __init__(self, text: str = '', elide_mode: Qt.TextElideMode = Qt.ElideRight):
+        super().__init__()
+        self._full_text = ''
+        self.elide_mode = elide_mode
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt naming
+        self._full_text = str(text or '')
+        self.setToolTip(self._full_text)
+        self.update()
+
+    def text(self) -> str:
+        return self._full_text
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt naming
+        return QSize(0, self.fontMetrics().height() + 6)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt naming
+        return QSize(0, self.fontMetrics().height() + 6)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        painter = QPainter(self)
+        painter.setFont(self.font())
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        margins = self.contentsMargins()
+        rect = self.rect().adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        text = self.fontMetrics().elidedText(self._full_text, self.elide_mode, max(0, rect.width()))
+        painter.drawText(rect, self.alignment() | Qt.AlignVCenter, text)
+        painter.end()
+
+
 class CleanComboBox(QComboBox):
     """ComboBox with a small painted chevron instead of Qt's bulky arrow box."""
 
@@ -378,9 +412,13 @@ class QtArtworkWindow(QMainWindow):
         self.last_search_log: List[str] = []
         self.pending_approval_row = 0
         self._restoring_queue_columns = False
+        self._restoring_main_splitter = False
         self.queue_column_save_timer = QTimer(self)
         self.queue_column_save_timer.setSingleShot(True)
         self.queue_column_save_timer.timeout.connect(self._save_queue_column_widths)
+        self.main_splitter_save_timer = QTimer(self)
+        self.main_splitter_save_timer.setSingleShot(True)
+        self.main_splitter_save_timer.timeout.connect(self._save_main_splitter_sizes)
 
         self.setWindowTitle(f'Artwork Manager Qt Prototype - {BUILD_VERSION}')
         self.resize(1380, 860)
@@ -423,6 +461,8 @@ class QtArtworkWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setChildrenCollapsible(False)
+        splitter.splitterMoved.connect(self._main_splitter_moved)
+        self.main_splitter = splitter
         root_layout.addWidget(splitter, 1)
 
         left = self._build_queue_panel()
@@ -431,7 +471,7 @@ class QtArtworkWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
-        splitter.setSizes([620, 760])
+        QTimer.singleShot(0, self._apply_main_splitter_sizes)
 
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
@@ -470,6 +510,7 @@ class QtArtworkWindow(QMainWindow):
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
+        self.table.setTextElideMode(Qt.ElideRight)
         self.table.setShowGrid(False)
         self.table.setCornerButtonEnabled(False)
         self.table.verticalHeader().setVisible(False)
@@ -494,9 +535,9 @@ class QtArtworkWindow(QMainWindow):
         layout.setContentsMargins(12, 4, 0, 0)
         layout.setSpacing(12)
 
-        self.album_title = QLabel('No album selected')
+        self.album_title = ElidedLabel('No album selected')
         self.album_title.setObjectName('albumTitle')
-        self.album_subtitle = QLabel('')
+        self.album_subtitle = ElidedLabel('')
         self.album_subtitle.setObjectName('mutedLabel')
         layout.addWidget(self.album_title)
         layout.addWidget(self.album_subtitle)
@@ -517,6 +558,7 @@ class QtArtworkWindow(QMainWindow):
         self.candidate_list = QListWidget()
         self.candidate_list.setObjectName('candidateList')
         self.candidate_list.setSpacing(2)
+        self.candidate_list.setTextElideMode(Qt.ElideRight)
         self.candidate_list.currentRowChanged.connect(self._select_candidate)
         lower.addWidget(self.candidate_list)
 
@@ -537,6 +579,16 @@ class QtArtworkWindow(QMainWindow):
         self.approval_progress.setVisible(False)
         self.approval_progress.setFixedHeight(8)
         layout.addWidget(self.approval_progress)
+
+        options = QHBoxLayout()
+        options.addStretch(1)
+        self.backup_checkbox = QCheckBox('Backup before embed')
+        self.backup_checkbox.setObjectName('inlineOption')
+        self.backup_checkbox.setChecked(bool(self.settings.get('backup_before_embedding', False)))
+        self.backup_checkbox.setToolTip('Save music-file backups before embedding')
+        self.backup_checkbox.toggled.connect(self._save_backup_preference)
+        options.addWidget(self.backup_checkbox)
+        layout.addLayout(options)
 
         actions = QHBoxLayout()
         self.find_btn = QPushButton('Find Artwork')
@@ -561,11 +613,7 @@ class QtArtworkWindow(QMainWindow):
         self.approve_btn.clicked.connect(self.approve_selected_candidate)
         actions.addWidget(self.approve_btn)
 
-        self.backup_checkbox = QCheckBox('Backup')
-        self.backup_checkbox.setChecked(bool(self.settings.get('backup_before_embedding', False)))
-        self.backup_checkbox.setToolTip('Save music-file backups before embedding')
-        self.backup_checkbox.toggled.connect(self._save_backup_preference)
-        actions.addWidget(self.backup_checkbox)
+        actions.addStretch(1)
 
         self.open_folder_btn = QPushButton('Open Album Folder')
         self.open_folder_btn.setObjectName('quietButton')
@@ -579,7 +627,6 @@ class QtArtworkWindow(QMainWindow):
         self.open_source_btn.clicked.connect(self.open_source_page)
         actions.addWidget(self.open_folder_btn)
         actions.addWidget(self.open_source_btn)
-        actions.addStretch(1)
         layout.addLayout(actions)
         return panel
 
@@ -700,6 +747,45 @@ class QtArtworkWindow(QMainWindow):
             layout['queue_columns'] = widths
             self.settings['layout'] = layout
             save_settings({'layout': {'queue_columns': widths}})
+        except Exception:
+            pass
+
+    def _main_splitter_sizes_from_settings(self) -> List[int]:
+        layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
+        raw = layout.get('qt_main_splitter')
+        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            sizes = []
+            for value in raw[:2]:
+                try:
+                    sizes.append(max(180, int(value)))
+                except Exception:
+                    return []
+            return sizes
+        return []
+
+    def _apply_main_splitter_sizes(self) -> None:
+        if not hasattr(self, 'main_splitter'):
+            return
+        sizes = self._main_splitter_sizes_from_settings() or [620, 760]
+        self._restoring_main_splitter = True
+        try:
+            self.main_splitter.setSizes(sizes)
+        finally:
+            self._restoring_main_splitter = False
+
+    def _main_splitter_moved(self, _pos: int, _index: int) -> None:
+        if self._restoring_main_splitter:
+            return
+        self.main_splitter_save_timer.start(350)
+
+    def _save_main_splitter_sizes(self) -> None:
+        try:
+            sizes = [int(size) for size in self.main_splitter.sizes()]
+            layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
+            layout = dict(layout)
+            layout['qt_main_splitter'] = sizes
+            self.settings['layout'] = layout
+            save_settings({'layout': {'qt_main_splitter': sizes}})
         except Exception:
             pass
 
@@ -1145,6 +1231,9 @@ class QtArtworkWindow(QMainWindow):
         if self.queue_column_save_timer.isActive():
             self.queue_column_save_timer.stop()
             self._save_queue_column_widths()
+        if self.main_splitter_save_timer.isActive():
+            self.main_splitter_save_timer.stop()
+            self._save_main_splitter_sizes()
         if self.search_worker is not None:
             try:
                 self.search_worker.stop()
