@@ -14,7 +14,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QRectF, QSize, Qt, QThread, Signal
+from PySide6.QtCore import QRectF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -53,6 +53,18 @@ from .utils import open_path
 
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 FILTERS = ('All', 'Needs Attention', 'Review', 'Missing', 'Needs Search', 'Not Square', 'Convert', 'Good', 'Handled')
+QUEUE_COLUMNS = ('status', 'artist', 'album', 'current', 'candidates')
+DEFAULT_QUEUE_COLUMN_WIDTHS = {
+    'status': 96,
+    'artist': 220,
+    'album': 360,
+    'current': 128,
+    'candidates': 68,
+}
+QUEUE_COLUMN_ALIASES = {
+    'size': 'current',
+    'options': 'candidates',
+}
 BUCKET_COLORS = {
     'Review': ('#17345c', '#e7f0ff'),
     'Missing': ('#5c3217', '#fff0df'),
@@ -364,6 +376,11 @@ class QtArtworkWindow(QMainWindow):
         self.search_worker: Optional[SearchWorker] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
         self.last_search_log: List[str] = []
+        self.pending_approval_row = 0
+        self._restoring_queue_columns = False
+        self.queue_column_save_timer = QTimer(self)
+        self.queue_column_save_timer.setSingleShot(True)
+        self.queue_column_save_timer.timeout.connect(self._save_queue_column_widths)
 
         self.setWindowTitle(f'Artwork Manager Qt Prototype - {BUILD_VERSION}')
         self.resize(1380, 860)
@@ -412,9 +429,9 @@ class QtArtworkWindow(QMainWindow):
         right = self._build_review_panel()
         splitter.addWidget(left)
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([470, 900])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([620, 760])
 
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
@@ -457,14 +474,17 @@ class QtArtworkWindow(QMainWindow):
         self.table.setCornerButtonEnabled(False)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(31)
-        self.table.horizontalHeader().setStretchLastSection(False)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        header.setSectionsMovable(False)
+        header.setMinimumSectionSize(52)
+        header.setToolTip('Drag column dividers to resize the album list.')
+        for col in range(self.table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+        header.sectionResized.connect(self._queue_column_resized)
         self.table.itemSelectionChanged.connect(self._select_table_album)
         layout.addWidget(self.table, 1)
+        QTimer.singleShot(0, self._apply_queue_column_widths)
 
         return panel
 
@@ -617,6 +637,71 @@ class QtArtworkWindow(QMainWindow):
     def _sort_bucket(self, album: Dict[str, Any]) -> int:
         order = {'Review': 0, 'Missing': 1, 'Needs Search': 2, 'Not Square': 3, 'Convert': 4, 'Good': 5, 'Handled': 6}
         return order.get(self._album_bucket(album), 99)
+
+    def _queue_column_widths_from_settings(self) -> Dict[str, int]:
+        layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
+        saved = layout.get('queue_columns') if isinstance(layout.get('queue_columns'), dict) else {}
+        widths = self._default_queue_column_widths()
+        for name, value in saved.items():
+            name = QUEUE_COLUMN_ALIASES.get(name, name)
+            if name not in widths:
+                continue
+            try:
+                widths[name] = max(52, int(value))
+            except Exception:
+                pass
+        return widths
+
+    def _default_queue_column_widths(self) -> Dict[str, int]:
+        available = max(0, int(self.table.viewport().width()) - 2)
+        if available <= 80:
+            return dict(DEFAULT_QUEUE_COLUMN_WIDTHS)
+        minimums = {'status': 68, 'artist': 90, 'album': 110, 'current': 82, 'candidates': 52}
+        available = max(sum(minimums.values()), available)
+        if available < 680:
+            status_w, current_w, candidates_w = 78, 116, 52
+            artist_min, album_min, artist_cap = 90, 110, 160
+        else:
+            status_w, current_w, candidates_w = 96, 128, 68
+            artist_min, album_min, artist_cap = 140, 220, 260
+        remaining = max(
+            artist_min + album_min,
+            available - status_w - current_w - candidates_w,
+        )
+        artist_w = min(artist_cap, max(artist_min, int(remaining * 0.36)))
+        album_w = max(album_min, remaining - artist_w)
+        return {
+            'status': status_w,
+            'artist': artist_w,
+            'album': album_w,
+            'current': current_w,
+            'candidates': candidates_w,
+        }
+
+    def _apply_queue_column_widths(self) -> None:
+        widths = self._queue_column_widths_from_settings()
+        self._restoring_queue_columns = True
+        try:
+            for col, name in enumerate(QUEUE_COLUMNS):
+                self.table.setColumnWidth(col, widths.get(name, DEFAULT_QUEUE_COLUMN_WIDTHS.get(name, 100)))
+        finally:
+            self._restoring_queue_columns = False
+
+    def _queue_column_resized(self, _logical_index: int, _old_size: int, _new_size: int) -> None:
+        if self._restoring_queue_columns:
+            return
+        self.queue_column_save_timer.start(350)
+
+    def _save_queue_column_widths(self) -> None:
+        try:
+            widths = {name: int(self.table.columnWidth(col)) for col, name in enumerate(QUEUE_COLUMNS)}
+            layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
+            layout = dict(layout)
+            layout['queue_columns'] = widths
+            self.settings['layout'] = layout
+            save_settings({'layout': {'queue_columns': widths}})
+        except Exception:
+            pass
 
     def _render_table(self) -> None:
         self.table.blockSignals(True)
@@ -956,6 +1041,7 @@ class QtArtworkWindow(QMainWindow):
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
         self.statusBar().showMessage('Embedding artwork...')
+        self.pending_approval_row = max(0, self.table.currentRow())
 
         worker = ApprovalWorker(candidate, backup, self)
         worker.progress.connect(self._approval_progress)
@@ -993,7 +1079,10 @@ class QtArtworkWindow(QMainWindow):
             self.statusBar().showMessage(message)
             QMessageBox.warning(self, 'Approval incomplete', f'{message}\n\nUpdated {updated}/{total} file(s).')
         self.reload_queue(select_first=False)
-        self._select_album_key(result.get('album_key'), fallback_first=True)
+        if complete:
+            self._select_next_actionable_row(start_row=self.pending_approval_row)
+        else:
+            self._select_album_key(result.get('album_key'), fallback_first=True)
 
     def _approval_failed(self, message: str) -> None:
         self.approval_progress.setVisible(False)
@@ -1019,6 +1108,19 @@ class QtArtworkWindow(QMainWindow):
             return True
         return False
 
+    def _select_next_actionable_row(self, *, start_row: int = 0) -> bool:
+        if not self.visible_albums:
+            return False
+        actionable = {'Review', 'Missing', 'Needs Search', 'Not Square', 'Convert'}
+        start = max(0, min(int(start_row or 0), len(self.visible_albums) - 1))
+        for offset in range(len(self.visible_albums)):
+            row = (start + offset) % len(self.visible_albums)
+            if self._album_bucket(self.visible_albums[row]) in actionable:
+                self.table.selectRow(row)
+                return True
+        self.table.selectRow(0)
+        return True
+
     def open_album_folder(self) -> None:
         album = self.current_album or {}
         path = _text(album.get('album_path'))
@@ -1040,6 +1142,9 @@ class QtArtworkWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self.queue_column_save_timer.isActive():
+            self.queue_column_save_timer.stop()
+            self._save_queue_column_widths()
         if self.search_worker is not None:
             try:
                 self.search_worker.stop()
@@ -1065,6 +1170,9 @@ class QtArtworkWindow(QMainWindow):
                 background: #f5f5f7;
                 color: #1d1d1f;
                 font-size: 13px;
+            }
+            QLabel {
+                background: transparent;
             }
             QToolBar#mainToolbar {
                 background: #fbfbfd;
@@ -1174,6 +1282,7 @@ class QtArtworkWindow(QMainWindow):
             QHeaderView::section {
                 background: #f1f2f5;
                 border: 0;
+                border-right: 1px solid #dde1e8;
                 border-bottom: 1px solid #d8d8de;
                 padding: 6px;
                 font-weight: 700;
