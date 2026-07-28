@@ -4,19 +4,19 @@ set -e
 cd "$(dirname "$0")"
 
 if ! command -v python3.11 >/dev/null 2>&1; then
-  echo "Python 3.11 is required for the Qt prototype."
+  echo "Python 3.11 is required for the Qt artwork review app."
   echo "Install Python 3.11 or newer, then run this launcher again."
   exit 1
 fi
 
 if [ ! -d ".venv-qt" ]; then
-  echo "Creating Qt prototype environment..."
+  echo "Creating Qt artwork review environment..."
   python3.11 -m venv .venv-qt
 fi
 
-echo "Installing/updating Qt prototype dependencies..."
+echo "Installing/updating Qt artwork review dependencies..."
 .venv-qt/bin/python -m pip install --upgrade pip
 .venv-qt/bin/python -m pip install -r requirements-qt.txt
 
-echo "Starting Artwork Manager Qt Prototype..."
+echo "Starting Artwork Manager..."
 .venv-qt/bin/python -m artwork_manager_app.run_qt_app

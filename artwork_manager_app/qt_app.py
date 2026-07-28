@@ -1,13 +1,12 @@
-"""Experimental PySide6 UI for artwork review.
+"""PySide6 UI for artwork review.
 
-This prototype deliberately reuses the existing database, state, and media
-helpers. It is not a replacement for the Tk app yet: queue browsing, artwork
-inspection, and Approve + Embed live here first while scanning/search remain in
-the stable app.
+This view reuses the existing database, state, and media helpers while the
+established Tk window still owns scan, settings, and bulk maintenance tools.
 """
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import webbrowser
@@ -61,13 +60,26 @@ FILTER_CHIPS = (
     ('Done', 'Done'),
     ('All', 'All'),
 )
+FILTER_TOOLTIPS = {
+    'Needs Work': 'Albums that need artwork, conversion, or a fresh search.',
+    'Review': 'Albums with saved artwork options ready to check.',
+    'Done': 'Albums already marked good, approved, handled, or skipped.',
+    'All': 'Show every album record.',
+}
 QUEUE_COLUMNS = ('status', 'artist', 'album', 'current', 'candidates')
 DEFAULT_QUEUE_COLUMN_WIDTHS = {
-    'status': 96,
+    'status': 104,
     'artist': 220,
     'album': 360,
     'current': 128,
     'candidates': 68,
+}
+QUEUE_COLUMN_MIN_WIDTHS = {
+    'status': 88,
+    'artist': 90,
+    'album': 110,
+    'current': 104,
+    'candidates': 52,
 }
 QUEUE_COLUMN_ALIASES = {
     'size': 'current',
@@ -98,6 +110,14 @@ def _album_size(album: Dict[str, Any]) -> str:
         return f'{int(w)} x {int(h)}'
     except Exception:
         return 'Missing'
+
+
+def _queue_status_label(bucket: str) -> str:
+    return {
+        'Needs Search': 'Search',
+        'Not Square': 'Square',
+        'Handled': 'Done',
+    }.get(bucket, bucket)
 
 
 def _path_tail(path: str, parts: int = 3) -> str:
@@ -187,7 +207,7 @@ def _first_music_file(album: Dict[str, Any]) -> str:
         fp = os.path.join(album_path, example)
         if os.path.exists(fp):
             return fp
-    # Keep the prototype gentle on NAS paths: only inspect the album top level.
+    # Keep NAS browsing light: only inspect the album top level for a preview file.
     try:
         for name in sorted(os.listdir(album_path), key=lambda item: item.lower()):
             fp = os.path.join(album_path, name)
@@ -341,6 +361,7 @@ class ImagePanel(QFrame):
     def set_placeholder(self, text: str, meta: str = '') -> None:
         self.image_label.setText(text)
         self.image_label.setPixmap(QPixmap())
+        self.image_label.setProperty('sourcePixmap', None)
         self.meta_label.setText(meta)
 
     def set_image(self, source: Any, meta: str = '') -> bool:
@@ -434,6 +455,7 @@ class QtArtworkWindow(QMainWindow):
         self.search_worker: Optional[SearchWorker] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
         self.last_search_log: List[str] = []
+        self.last_search_album_key = ''
         self.pending_approval_row = 0
         self._restoring_queue_controls = False
         self._restoring_queue_columns = False
@@ -447,8 +469,9 @@ class QtArtworkWindow(QMainWindow):
         self.main_splitter_save_timer = QTimer(self)
         self.main_splitter_save_timer.setSingleShot(True)
         self.main_splitter_save_timer.timeout.connect(self._save_main_splitter_sizes)
+        self._first_queue_load = True
 
-        self.setWindowTitle(f'Artwork Manager Qt Prototype - {BUILD_VERSION}')
+        self.setWindowTitle(f'Artwork Manager - {BUILD_VERSION}')
         self.resize(1380, 860)
         self.setMinimumSize(1100, 700)
 
@@ -471,16 +494,10 @@ class QtArtworkWindow(QMainWindow):
         refresh.triggered.connect(lambda: self.reload_queue(select_first=False))
         toolbar.addAction(refresh)
 
-        open_tk = QAction(_line_icon('app'), 'Stable App', self)
-        open_tk.setToolTip('Open the stable app for scan and settings tools')
-        open_tk.triggered.connect(self._show_tk_hint)
+        open_tk = QAction(_line_icon('app'), 'Scan + Settings', self)
+        open_tk.setToolTip('Open scan, settings, and maintenance tools')
+        open_tk.triggered.connect(self._open_scan_tools)
         toolbar.addAction(open_tk)
-
-        toolbar.addSeparator()
-
-        readonly = QLabel('Qt')
-        readonly.setObjectName('readonlyPill')
-        toolbar.addWidget(readonly)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -530,6 +547,7 @@ class QtArtworkWindow(QMainWindow):
         self._restoring_queue_controls = True
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText('Search artist, album, folder...')
+        self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setText(saved_search)
         self._restoring_queue_controls = False
         self.search_edit.textChanged.connect(self._queue_search_changed)
@@ -545,11 +563,17 @@ class QtArtworkWindow(QMainWindow):
             chip.setMinimumWidth(0)
             chip.setMinimumHeight(28)
             chip.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            chip.setToolTip(FILTER_TOOLTIPS.get(filter_name, ''))
             chip.clicked.connect(lambda _checked=False, name=filter_name: self._set_queue_filter(name))
             chips.addWidget(chip)
             self.filter_chips[filter_name] = chip
         chips.addStretch(1)
         layout.addLayout(chips)
+
+        self.queue_empty_label = QLabel('')
+        self.queue_empty_label.setObjectName('emptyHint')
+        self.queue_empty_label.setVisible(False)
+        layout.addWidget(self.queue_empty_label)
 
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(['Status', 'Artist', 'Album', 'Size', 'Opts'])
@@ -566,7 +590,7 @@ class QtArtworkWindow(QMainWindow):
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionsMovable(False)
-        header.setMinimumSectionSize(52)
+        header.setMinimumSectionSize(min(QUEUE_COLUMN_MIN_WIDTHS.values()))
         header.setToolTip('Drag column dividers to resize the album list.')
         for col in range(self.table.columnCount()):
             header.setSectionResizeMode(col, QHeaderView.Interactive)
@@ -686,6 +710,9 @@ class QtArtworkWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, 'Queue load failed', str(exc))
             self.albums = []
+        if self._first_queue_load:
+            self._choose_initial_queue_filter()
+            self._first_queue_load = False
         self.apply_filters()
         if select_first and self.visible_albums:
             self.table.selectRow(0)
@@ -720,6 +747,20 @@ class QtArtworkWindow(QMainWindow):
         if filter_name == 'Review':
             return 'Review'
         return 'All'
+
+    def _choose_initial_queue_filter(self) -> None:
+        if self.search_edit.text().strip():
+            return
+        counts = self._queue_bucket_counts()
+        current = self._normalise_queue_filter(self.queue_filter)
+        if counts.get(current, 0) > 0 or current == 'All':
+            self.queue_filter = current
+            return
+        for filter_name in ('Needs Work', 'Review', 'Done', 'All'):
+            if counts.get(filter_name, 0) > 0:
+                self.queue_filter = filter_name
+                return
+        self.queue_filter = 'All'
 
     def _set_queue_filter(self, filter_name: str) -> None:
         filter_name = self._normalise_queue_filter(filter_name)
@@ -777,6 +818,7 @@ class QtArtworkWindow(QMainWindow):
         return counts
 
     def apply_filters(self) -> None:
+        current_key = _text((self.current_album or {}).get('album_key'))
         query = self.search_edit.text().strip().lower() if hasattr(self, 'search_edit') else ''
         selected_filter = self._normalise_queue_filter(self.queue_filter)
         visible = []
@@ -815,10 +857,73 @@ class QtArtworkWindow(QMainWindow):
         self.visible_albums = visible
         self._render_table()
         self._refresh_filter_chips(counts)
+        self._sync_selection_after_filter(current_key)
+
+    def _sync_selection_after_filter(self, preferred_key: str = '') -> None:
+        if not self.visible_albums:
+            self._clear_review_state()
+            return
+        if preferred_key and self._select_album_key(preferred_key, fallback_first=False):
+            return
+        self._select_visible_row(0)
+
+    def _clear_review_state(self) -> None:
+        self.current_album = None
+        self.current_candidates = []
+        self.candidate_list.clear()
+        self.album_title.setText('No album selected')
+        self.album_subtitle.setText('')
+        self.current_panel.set_placeholder('No artwork')
+        self.candidate_panel.set_placeholder('No artwork')
+        self.details.setPlainText('')
+        self.details.setPlaceholderText('Select an album to review.')
+        self.open_folder_btn.setEnabled(False)
+        self.open_source_btn.setEnabled(False)
+        busy = any([
+            self.search_worker is not None and self.search_worker.isRunning(),
+            self.approval_worker is not None and self.approval_worker.isRunning(),
+        ])
+        if not busy:
+            self.approval_status.setText('')
+            self.approval_progress.setVisible(False)
+        self._refresh_action_states()
+
+    def _update_queue_empty_state(self) -> None:
+        if not hasattr(self, 'queue_empty_label'):
+            return
+        if self.visible_albums:
+            self.queue_empty_label.setVisible(False)
+            self.queue_empty_label.setText('')
+            return
+        if not self.albums:
+            message = 'No album records loaded.'
+        elif self.search_edit.text().strip():
+            message = 'No albums match this search.'
+        else:
+            message = f'No albums in {self._normalise_queue_filter(self.queue_filter)}.'
+        self.queue_empty_label.setText(message)
+        self.queue_empty_label.setVisible(True)
 
     def _sort_bucket(self, album: Dict[str, Any]) -> int:
         order = {'Review': 0, 'Missing': 1, 'Needs Search': 2, 'Not Square': 3, 'Convert': 4, 'Good': 5, 'Handled': 6}
         return order.get(self._album_bucket(album), 99)
+
+    def _queue_filter_for_album_key(self, album_key: Any) -> str:
+        key = _text(album_key)
+        if not key:
+            return ''
+        for album in self.albums:
+            if _text(album.get('album_key')) != key:
+                continue
+            bucket = self._album_bucket(album)
+            if bucket in WORK_BUCKETS:
+                return 'Needs Work'
+            if bucket == 'Review':
+                return 'Review'
+            if bucket in DONE_BUCKETS:
+                return 'Done'
+            return 'All'
+        return ''
 
     def _queue_column_widths_from_settings(self) -> Dict[str, int]:
         layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
@@ -829,7 +934,7 @@ class QtArtworkWindow(QMainWindow):
             if name not in widths:
                 continue
             try:
-                widths[name] = max(52, int(value))
+                widths[name] = max(QUEUE_COLUMN_MIN_WIDTHS.get(name, 52), int(value))
             except Exception:
                 pass
         return widths
@@ -838,13 +943,13 @@ class QtArtworkWindow(QMainWindow):
         available = max(0, int(self.table.viewport().width()) - 2)
         if available <= 80:
             return dict(DEFAULT_QUEUE_COLUMN_WIDTHS)
-        minimums = {'status': 68, 'artist': 90, 'album': 110, 'current': 82, 'candidates': 52}
+        minimums = dict(QUEUE_COLUMN_MIN_WIDTHS)
         available = max(sum(minimums.values()), available)
         if available < 680:
-            status_w, current_w, candidates_w = 78, 116, 52
+            status_w, current_w, candidates_w = 88, 116, 52
             artist_min, album_min, artist_cap = 90, 110, 160
         else:
-            status_w, current_w, candidates_w = 96, 128, 68
+            status_w, current_w, candidates_w = 104, 128, 68
             artist_min, album_min, artist_cap = 140, 220, 260
         remaining = max(
             artist_min + album_min,
@@ -930,7 +1035,7 @@ class QtArtworkWindow(QMainWindow):
         for row, album in enumerate(self.visible_albums):
             bucket = self._album_bucket(album)
             values = [
-                bucket,
+                _queue_status_label(bucket),
                 _text(album.get('artist'), 'Unknown Artist'),
                 _text(album.get('album'), 'Unknown Album'),
                 _album_size(album),
@@ -941,13 +1046,13 @@ class QtArtworkWindow(QMainWindow):
                 if col in (3, 4):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 if col == 0:
-                    fg, bg = BUCKET_COLORS.get(bucket, ('#46505d', '#edf0f5'))
+                    fg, _bg = BUCKET_COLORS.get(bucket, ('#46505d', '#edf0f5'))
                     item.setForeground(QBrush(QColor(fg)))
-                    item.setBackground(QBrush(QColor(bg)))
                     item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(row, col, item)
         self.table.blockSignals(False)
         self.count_label.setText(f'{len(self.visible_albums)} shown')
+        self._update_queue_empty_state()
 
     def _select_table_album(self) -> None:
         rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
@@ -956,6 +1061,16 @@ class QtArtworkWindow(QMainWindow):
         row = rows[0]
         if 0 <= row < len(self.visible_albums):
             self.show_album(self.visible_albums[row])
+
+    def _select_visible_row(self, row: int) -> bool:
+        if not (0 <= row < len(self.visible_albums)):
+            return False
+        album = self.visible_albums[row]
+        key = _text(album.get('album_key'))
+        self.table.selectRow(row)
+        if _text((self.current_album or {}).get('album_key')) != key:
+            self.show_album(album)
+        return True
 
     def show_album(self, album: Dict[str, Any]) -> None:
         self.current_album = album
@@ -1116,7 +1231,7 @@ class QtArtworkWindow(QMainWindow):
                 _text(self.last_approval_result.get('final_reason'), '-'),
                 f"Files: {int(self.last_approval_result.get('updated_files') or 0)} / {int(self.last_approval_result.get('total_files') or 0)}",
             ])
-        if self.last_search_log:
+        if self.last_search_log and album and self.last_search_album_key == _text(album.get('album_key')):
             recent = [_text(line) for line in self.last_search_log[-3:] if _text(line)]
             if recent:
                 lines.extend(['', 'Recent search:'])
@@ -1203,6 +1318,7 @@ class QtArtworkWindow(QMainWindow):
         max_per_album = get_max_candidates_per_album(self.settings)
         artist = _text(info.get('search_artist') or info.get('artist'), 'Unknown Artist')
         album = _text(info.get('search_album') or info.get('album'), 'Unknown Album')
+        self.last_search_album_key = _text(info.get('album_key'))
         self.last_search_log = [f'Searching: {artist} - {album}']
         self.approval_status.setText(f'Searching providers for {artist} - {album}...')
         self.approval_progress.setVisible(True)
@@ -1264,8 +1380,17 @@ class QtArtworkWindow(QMainWindow):
             message = 'No new artwork options found.'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
+        target_key = _text(result.get('album_key'))
         self.reload_queue(select_first=False)
-        self._select_album_key(result.get('album_key'), fallback_first=True)
+        if target_key and not self._select_album_key(target_key, fallback_first=False):
+            target_filter = self._queue_filter_for_album_key(target_key)
+            if target_filter:
+                self.queue_filter = target_filter
+                self.apply_filters()
+                self._schedule_queue_filter_state_save()
+                self._select_album_key(target_key, fallback_first=True)
+            else:
+                self._select_album_key(target_key, fallback_first=True)
         if not saved and not stopped:
             QMessageBox.information(self, 'Artwork search', message)
 
@@ -1368,11 +1493,9 @@ class QtArtworkWindow(QMainWindow):
         if key:
             for row, album in enumerate(self.visible_albums):
                 if _text(album.get('album_key')) == key:
-                    self.table.selectRow(row)
-                    return True
+                    return self._select_visible_row(row)
         if fallback_first and self.visible_albums:
-            self.table.selectRow(0)
-            return True
+            return self._select_visible_row(0)
         return False
 
     def _select_next_actionable_row(self, *, start_row: int = 0) -> bool:
@@ -1382,10 +1505,8 @@ class QtArtworkWindow(QMainWindow):
         for offset in range(len(self.visible_albums)):
             row = (start + offset) % len(self.visible_albums)
             if self._album_bucket(self.visible_albums[row]) in ACTIONABLE_BUCKETS:
-                self.table.selectRow(row)
-                return True
-        self.table.selectRow(0)
-        return True
+                return self._select_visible_row(row)
+        return self._select_visible_row(0)
 
     def open_album_folder(self) -> None:
         album = self.current_album or {}
@@ -1400,12 +1521,20 @@ class QtArtworkWindow(QMainWindow):
             if url:
                 webbrowser.open(url)
 
-    def _show_tk_hint(self) -> None:
-        QMessageBox.information(
-            self,
-            'Stable app',
-            'Use the existing Tk app for Scan, Convert/Save, bulk maintenance, and NAS worker settings. This Qt prototype can browse the queue, Find Artwork for the selected album, and Approve + Embed saved candidates.',
-        )
+    def _open_scan_tools(self) -> None:
+        try:
+            subprocess.Popen(
+                [sys.executable, '-m', 'artwork_manager_app.main'],
+                cwd=str(APP_DIR.parent),
+                start_new_session=True,
+            )
+            self.statusBar().showMessage('Opened Scan + Settings window.')
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                'Could not open Scan + Settings',
+                f'Open the main app with: python -m artwork_manager_app.main\n\n{exc}',
+            )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         if self.queue_filter_save_timer.isActive():
@@ -1466,13 +1595,6 @@ class QtArtworkWindow(QMainWindow):
                 background: #eef2f7;
                 border-color: #dde3ec;
             }
-            QLabel#readonlyPill {
-                color: #4f5f74;
-                background: #e8eef7;
-                border: 1px solid #cfd8e6;
-                border-radius: 8px;
-                padding: 4px 8px;
-            }
             QFrame#sidebar, QFrame#imagePanel {
                 background: #ffffff;
                 border: 1px solid #e0e3ea;
@@ -1492,6 +1614,10 @@ class QtArtworkWindow(QMainWindow):
             }
             QLabel#mutedLabel {
                 color: #666a73;
+            }
+            QLabel#emptyHint {
+                color: #6b7280;
+                padding: 1px 2px 2px 2px;
             }
             QLabel#artworkPreview {
                 background: #ffffff;
@@ -1697,7 +1823,7 @@ class QtArtworkWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName('Artwork Manager Qt Prototype')
+    app.setApplicationName('Artwork Manager')
     configure_app_font(app)
     icon_path = APP_DIR / 'assets' / 'app_icon.png'
     if icon_path.exists():

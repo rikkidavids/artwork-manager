@@ -56,19 +56,19 @@ git pull --ff-only origin qt-prototype
 
 if ! command -v python3.11 >/dev/null 2>&1; then
   echo
-  echo "Python 3.11 is required for the Qt prototype."
+  echo "Python 3.11 is required for the Qt artwork review app."
   echo "Install Python 3.11 or newer, then run this shortcut again."
   exit 1
 fi
 
 if [ ! -d ".venv-qt" ]; then
   echo
-  echo "Creating Qt prototype environment..."
+  echo "Creating Qt artwork review environment..."
   python3.11 -m venv .venv-qt
 fi
 
 echo
-echo "Installing/updating Qt prototype dependencies..."
+echo "Installing/updating Qt artwork review dependencies..."
 .venv-qt/bin/python -m pip install --upgrade pip
 .venv-qt/bin/python -m pip install -r requirements-qt.txt
 
