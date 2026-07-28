@@ -1,4 +1,4 @@
-import sqlite3, json, threading
+import sqlite3, json, os, threading
 from datetime import datetime
 from .config import DB_PATH
 
@@ -187,6 +187,41 @@ def get_album_by_path(album_path):
     with connect() as c:
         row = c.execute('SELECT * FROM albums WHERE album_path=?', (album_path,)).fetchone()
         return _decode_album(row)
+
+
+def find_album_by_path(album_path):
+    return get_album_by_path(album_path)
+
+
+def _path_resume_key(path):
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(str(path or ''))))
+    except Exception:
+        return str(path or '')
+
+
+def existing_album_resume_info():
+    """Return saved album path/key/fingerprint data for fast resume scans."""
+    out = {}
+    with connect() as c:
+        rows = c.execute('SELECT album_key, album_path, notes FROM albums WHERE album_path IS NOT NULL AND album_path<>""').fetchall()
+    for row in rows:
+        path = row['album_path'] or ''
+        notes = {}
+        try:
+            parsed = json.loads(row['notes'] or '{}')
+            if isinstance(parsed, dict):
+                notes = parsed
+        except Exception:
+            notes = {}
+        info = {
+            'album_key': row['album_key'],
+            'album_path': path,
+            'scan_fingerprint': notes.get('scan_fingerprint') if isinstance(notes.get('scan_fingerprint'), dict) else None,
+        }
+        out[path] = info
+        out[_path_resume_key(path)] = info
+    return out
 
 
 def existing_album_keys():

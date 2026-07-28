@@ -917,6 +917,10 @@ def scan_library(library_root, include_missing=True, progress=None, stop_event=N
                         continue
                     allow_key_resume_skip = False
                 else:
+                    fingerprint = _folder_music_fingerprint(root, music)
+                    existing_key = existing.get('album_key')
+                    if existing_key:
+                        db.update_album_notes(existing_key, {'scan_fingerprint': fingerprint})
                     if processed_music - last_db_progress >= 25:
                         db.update_scan_progress(processed_music, total_albums)
                         last_db_progress = processed_music

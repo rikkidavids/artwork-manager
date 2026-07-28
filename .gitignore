@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+.local_app_data/
+.DS_Store

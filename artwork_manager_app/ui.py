@@ -1474,12 +1474,21 @@ class App:
         self.compact_ui = (density_pref == 'Compact')
 
         saved_right = int(layout.get('right_panel_w') or 0) if str(layout.get('right_panel_w') or '').isdigit() else 0
-        # 3.38: give the queue panel a little more breathing room by default,
-        # while still preserving enough space for the two artwork previews on
-        # smaller displays.  Older saved layouts were often a touch too narrow,
-        # so gently lift them to the new target rather than requiring a reset.
-        target_right = min(840, max(620, int(win_w * 0.52)))
-        right_cap = min(940, int(win_w * 0.60))
+        # 4.55: modern MacBook Pro displays have enough pixels for a larger
+        # review surface. Keep the queue readable, but bias default queue-left
+        # layouts toward bigger current/candidate artwork previews.
+        if self.queue_left_layout:
+            target_right = min(760, max(600, int(win_w * 0.44)))
+            right_cap = min(860, int(win_w * 0.54))
+            # Older builds often saved a queue width near 52% of the window,
+            # which makes the covers feel tiny on a 14-inch MacBook Pro. Treat
+            # that old default as migratable while still preserving narrower or
+            # deliberately custom queue widths.
+            if saved_right and saved_right >= int(win_w * 0.50):
+                saved_right = target_right
+        else:
+            target_right = min(840, max(620, int(win_w * 0.52)))
+            right_cap = min(940, int(win_w * 0.60))
         if saved_right:
             self.right_panel_w = max(target_right, min(saved_right, right_cap))
         else:
@@ -1490,17 +1499,13 @@ class App:
         # the mini navigation buttons, scrollbars, paddings, and divider.  Use a
         # more conservative width budget in queue-left layout and cap preview
         # size so the option list remains visible on built-in displays.
-        left_floor = (585 if self.compact_ui else 635) if self.queue_left_layout else (540 if self.compact_ui else 585)
+        left_floor = (600 if self.compact_ui else 680) if self.queue_left_layout else (540 if self.compact_ui else 585)
         self.right_panel_w = max(560, min(self.right_panel_w, max(560, win_w - left_floor)))
         if self.queue_left_layout:
-            # 4.18: give the option cards enough room to read their three
-            # short lines.  Earlier queue-left builds protected artwork size so
-            # aggressively that the option card text clipped on the built-in
-            # display.  Let previews shrink a little before squeezing options.
-            self.candidate_list_w = 162 if self.compact_ui else 178
-            review_gutter_w = 118
-            min_art_px = 148 if self.compact_ui else 156
-            max_art_cap = 206 if self.compact_ui else 222
+            self.candidate_list_w = 180 if self.compact_ui else 198
+            review_gutter_w = 108
+            min_art_px = 170 if self.compact_ui else 184
+            max_art_cap = 285 if self.compact_ui else 320
         else:
             self.candidate_list_w = 165 if self.compact_ui else 185
             review_gutter_w = 96
