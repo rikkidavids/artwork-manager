@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -45,7 +46,8 @@ from PySide6.QtWidgets import (
 
 from .approval import ApprovalBlocked, approve_candidate, candidate_needs_warning, candidate_warning_text
 from . import database as db
-from .config import APP_DIR, BUILD_VERSION, load_settings, save_settings
+from .config import APP_DIR, BUILD_VERSION, get_max_candidates_per_album, load_settings, save_settings
+from .review_queue import build_candidates
 from .scanner import embedded_artwork
 from .state import evaluate_album_record, workflow_bucket_for_status
 from .utils import open_path
@@ -169,6 +171,60 @@ class ApprovalWorker(QThread):
             self.failed.emit(f'Embedding failed: {exc}')
 
 
+class SearchWorker(QThread):
+    status_update = Signal(str)
+    log_line = Signal(str)
+    candidate_found = Signal(object)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, infos: List[Dict[str, Any]], max_per_album: int, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.infos = [dict(info or {}) for info in infos]
+        self.max_per_album = int(max_per_album or 0)
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def run(self) -> None:
+        try:
+            before = {
+                info['album_key']: len(db.load_candidates_for_album(info['album_key'], include_rejected=False))
+                for info in self.infos
+                if info.get('album_key')
+            }
+            build_candidates(
+                self.infos,
+                max_per_album=self.max_per_album,
+                include_fallbacks=True,
+                stop_event=self.stop_event,
+                log=lambda line: self.log_line.emit(str(line or '')),
+                status=lambda text: self.status_update.emit(str(text or '')),
+                on_candidate=lambda candidate: self.candidate_found.emit(candidate),
+            )
+            after = {
+                info['album_key']: len(db.load_candidates_for_album(info['album_key'], include_rejected=False))
+                for info in self.infos
+                if info.get('album_key')
+            }
+            saved = sum(max(0, after.get(key, 0) - before.get(key, 0)) for key in before)
+            status_counts: Dict[str, int] = {}
+            for info in self.infos:
+                album = db.get_album(info.get('album_key')) or {}
+                status = album.get('status') or 'unknown'
+                status_counts[status] = status_counts.get(status, 0) + 1
+            self.completed.emit({
+                'album_key': self.infos[0].get('album_key') if self.infos else '',
+                'album_count': len(self.infos),
+                'saved': saved,
+                'stopped': self.stop_event.is_set(),
+                'status_counts': status_counts,
+            })
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class ImagePanel(QFrame):
     def __init__(self, title: str):
         super().__init__()
@@ -228,7 +284,9 @@ class QtArtworkWindow(QMainWindow):
         self.current_art_worker: Optional[CurrentArtWorker] = None
         self.current_art_workers: List[CurrentArtWorker] = []
         self.approval_worker: Optional[ApprovalWorker] = None
+        self.search_worker: Optional[SearchWorker] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
+        self.last_search_log: List[str] = []
 
         self.setWindowTitle(f'Artwork Manager Qt Prototype - {BUILD_VERSION}')
         self.resize(1380, 860)
@@ -378,6 +436,19 @@ class QtArtworkWindow(QMainWindow):
         layout.addWidget(self.approval_progress)
 
         actions = QHBoxLayout()
+        self.find_btn = QPushButton('Find Artwork')
+        self.find_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogContentsView))
+        self.find_btn.setIconSize(QSize(16, 16))
+        self.find_btn.clicked.connect(self.find_artwork_for_selected_album)
+        actions.addWidget(self.find_btn)
+
+        self.stop_search_btn = QPushButton('Stop')
+        self.stop_search_btn.setIcon(self.style().standardIcon(QStyle.SP_BrowserStop))
+        self.stop_search_btn.setIconSize(QSize(16, 16))
+        self.stop_search_btn.clicked.connect(self.stop_search)
+        self.stop_search_btn.setVisible(False)
+        actions.addWidget(self.stop_search_btn)
+
         self.approve_btn = QPushButton('Approve + Embed')
         self.approve_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
         self.approve_btn.setIconSize(QSize(16, 16))
@@ -587,6 +658,25 @@ class QtArtworkWindow(QMainWindow):
             return self.current_candidates[row]
         return None
 
+    def _album_to_search_info(self, album: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not album:
+            return None
+        return {
+            'artist': album.get('artist', ''),
+            'album': album.get('album', ''),
+            'album_key': album.get('album_key'),
+            'album_path': album.get('album_path') or album.get('album_folder'),
+            'search_artist': album.get('search_artist') or album.get('artist', ''),
+            'search_album': album.get('search_album') or album.get('album', ''),
+            'year': album.get('year') or '',
+            'mb_release_id': album.get('mb_release_id') or '',
+            'mb_releasegroup_id': album.get('mb_releasegroup_id') or '',
+            'identity_confidence': album.get('identity_confidence') or '',
+            'example_file': album.get('example_file') or '',
+            'width': album.get('width'),
+            'height': album.get('height'),
+        }
+
     def _render_details(self, candidate: Optional[Dict[str, Any]] = None) -> None:
         album = self.current_album or {}
         status, reason = self._album_status_reason(album) if album else ('', '')
@@ -626,6 +716,9 @@ class QtArtworkWindow(QMainWindow):
                 _text(self.last_approval_result.get('final_reason'), '-'),
                 f"Files: {int(self.last_approval_result.get('updated_files') or 0)} / {int(self.last_approval_result.get('total_files') or 0)}",
             ])
+        if self.last_search_log:
+            lines.extend(['', 'Search log:'])
+            lines.extend(self.last_search_log[-8:])
         self.details.setPlainText('\n'.join(lines))
 
     def _save_backup_preference(self) -> None:
@@ -638,11 +731,109 @@ class QtArtworkWindow(QMainWindow):
 
     def _refresh_action_states(self) -> None:
         has_candidate = self._selected_candidate() is not None
-        busy = self.approval_worker is not None and self.approval_worker.isRunning()
+        approval_busy = self.approval_worker is not None and self.approval_worker.isRunning()
+        search_busy = self.search_worker is not None and self.search_worker.isRunning()
+        busy = approval_busy or search_busy
+        album = self.current_album or {}
+        bucket = self._album_bucket(album) if album else ''
+        can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
+        self.find_btn.setEnabled(can_search and not busy)
+        self.stop_search_btn.setVisible(search_busy)
+        self.stop_search_btn.setEnabled(search_busy)
         self.approve_btn.setEnabled(has_candidate and not busy)
         self.backup_checkbox.setEnabled(not busy)
         self.open_folder_btn.setEnabled(bool(self.current_album and _text(self.current_album.get('album_path'))))
         self.open_source_btn.setEnabled(bool(has_candidate and _text((self._selected_candidate() or {}).get('source_url'))))
+
+    def find_artwork_for_selected_album(self) -> None:
+        info = self._album_to_search_info(self.current_album)
+        if not info or not info.get('album_key') or not info.get('album_path'):
+            QMessageBox.warning(self, 'Cannot search artwork', 'Select an album with a known folder first.')
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        max_per_album = get_max_candidates_per_album(self.settings)
+        artist = _text(info.get('search_artist') or info.get('artist'), 'Unknown Artist')
+        album = _text(info.get('search_album') or info.get('album'), 'Unknown Album')
+        self.last_search_log = [f'Searching: {artist} - {album}']
+        self.approval_status.setText(f'Searching providers for {artist} - {album}...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Finding artwork...')
+
+        worker = SearchWorker([info], max_per_album, self)
+        worker.status_update.connect(self._search_status)
+        worker.log_line.connect(self._search_log)
+        worker.candidate_found.connect(self._search_candidate_found)
+        worker.completed.connect(self._search_completed)
+        worker.failed.connect(self._search_failed)
+        worker.finished.connect(lambda w=worker: self._search_worker_finished(w))
+        self.search_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
+    def stop_search(self) -> None:
+        if self.search_worker is not None and self.search_worker.isRunning():
+            self.search_worker.stop()
+            self.approval_status.setText('Stopping artwork search...')
+            self.statusBar().showMessage('Stopping artwork search...')
+            self._refresh_action_states()
+
+    def _search_status(self, text: str) -> None:
+        text = _text(text, 'Searching artwork...')
+        self.approval_status.setText(text)
+        self.statusBar().showMessage(text)
+
+    def _search_log(self, line: str) -> None:
+        line = _text(line)
+        if not line:
+            return
+        self.last_search_log.append(line)
+        self.last_search_log = self.last_search_log[-30:]
+        self._render_details(self._selected_candidate())
+
+    def _search_candidate_found(self, candidate: object) -> None:
+        cand = dict(candidate or {})
+        if self.current_album and cand.get('album_key') == self.current_album.get('album_key'):
+            self._load_candidates(self.current_album)
+            self.candidate_list.setCurrentRow(max(0, self.candidate_list.count() - 1))
+        source = _text(cand.get('source'), 'Artwork')
+        dims = ''
+        if cand.get('width') and cand.get('height'):
+            dims = f" {cand.get('width')} x {cand.get('height')}"
+        self.approval_status.setText(f'Saved {source}{dims}')
+
+    def _search_completed(self, result: object) -> None:
+        result = dict(result or {})
+        self.approval_progress.setVisible(False)
+        saved = int(result.get('saved') or 0)
+        stopped = bool(result.get('stopped'))
+        if stopped:
+            message = f'Search stopped after saving {saved} option(s).'
+        elif saved:
+            message = f'Found {saved} new artwork option(s).'
+        else:
+            message = 'No new artwork options found.'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        self.reload_queue(select_first=False)
+        self._select_album_key(result.get('album_key'), fallback_first=True)
+        if not saved and not stopped:
+            QMessageBox.information(self, 'Artwork search', message)
+
+    def _search_failed(self, message: str) -> None:
+        self.approval_progress.setVisible(False)
+        self.approval_status.setText(f'Search failed: {message}')
+        self.statusBar().showMessage('Artwork search failed')
+        QMessageBox.warning(self, 'Artwork search failed', message)
+        self._refresh_action_states()
+
+    def _search_worker_finished(self, worker: SearchWorker) -> None:
+        if self.search_worker is worker:
+            self.search_worker = None
+        self._refresh_action_states()
 
     def approve_selected_candidate(self) -> None:
         candidate = self._selected_candidate()
@@ -751,10 +942,16 @@ class QtArtworkWindow(QMainWindow):
         QMessageBox.information(
             self,
             'Stable app',
-            'Use the existing Tk app for Scan, Find Artwork, Convert/Save, bulk maintenance, and NAS worker settings. This Qt prototype can browse the queue and Approve + Embed saved candidates.',
+            'Use the existing Tk app for Scan, Convert/Save, bulk maintenance, and NAS worker settings. This Qt prototype can browse the queue, Find Artwork for the selected album, and Approve + Embed saved candidates.',
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self.search_worker is not None:
+            try:
+                self.search_worker.stop()
+                self.search_worker.wait(500)
+            except Exception:
+                pass
         if self.approval_worker is not None:
             try:
                 self.approval_worker.wait(500)
