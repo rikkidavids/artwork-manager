@@ -1,8 +1,9 @@
-"""Experimental PySide6 UI for read-only artwork review.
+"""Experimental PySide6 UI for artwork review.
 
 This prototype deliberately reuses the existing database, state, and media
-helpers. It is not a replacement for the Tk app yet: the first goal is to make
-queue browsing and artwork inspection feel modern while keeping writes disabled.
+helpers. It is not a replacement for the Tk app yet: queue browsing, artwork
+inspection, and Approve + Embed live here first while scanning/search remain in
+the stable app.
 """
 from __future__ import annotations
 
@@ -12,10 +13,11 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QSize, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QFont, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSplitter,
@@ -40,8 +43,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .approval import ApprovalBlocked, approve_candidate, candidate_needs_warning, candidate_warning_text
 from . import database as db
-from .config import APP_DIR, BUILD_VERSION, load_settings
+from .config import APP_DIR, BUILD_VERSION, load_settings, save_settings
 from .scanner import embedded_artwork
 from .state import evaluate_album_record, workflow_bucket_for_status
 from .utils import open_path
@@ -141,6 +145,30 @@ class CurrentArtWorker(QThread):
         self.loaded.emit(self.album_key, data, dims, self.source_file)
 
 
+class ApprovalWorker(QThread):
+    progress = Signal(int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, candidate: Dict[str, Any], backup: bool, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.candidate = dict(candidate or {})
+        self.backup = bool(backup)
+
+    def run(self) -> None:
+        try:
+            result = approve_candidate(
+                self.candidate,
+                backup=self.backup,
+                progress=lambda done, total, path: self.progress.emit(int(done or 0), int(total or 0), str(path or '')),
+            )
+            self.completed.emit(result)
+        except ApprovalBlocked as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(f'Embedding failed: {exc}')
+
+
 class ImagePanel(QFrame):
     def __init__(self, title: str):
         super().__init__()
@@ -199,6 +227,8 @@ class QtArtworkWindow(QMainWindow):
         self.current_candidates: List[Dict[str, Any]] = []
         self.current_art_worker: Optional[CurrentArtWorker] = None
         self.current_art_workers: List[CurrentArtWorker] = []
+        self.approval_worker: Optional[ApprovalWorker] = None
+        self.last_approval_result: Optional[Dict[str, Any]] = None
 
         self.setWindowTitle(f'Artwork Manager Qt Prototype - {BUILD_VERSION}')
         self.resize(1380, 860)
@@ -213,6 +243,8 @@ class QtArtworkWindow(QMainWindow):
         toolbar = QToolBar('Main')
         toolbar.setMovable(False)
         toolbar.setObjectName('mainToolbar')
+        toolbar.setIconSize(QSize(16, 16))
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
         style = self.style()
 
@@ -228,7 +260,7 @@ class QtArtworkWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        readonly = QLabel('Read-only prototype')
+        readonly = QLabel('Qt prototype')
         readonly.setObjectName('readonlyPill')
         toolbar.addWidget(readonly)
 
@@ -335,12 +367,36 @@ class QtArtworkWindow(QMainWindow):
         lower.setSizes([320, 560])
         layout.addWidget(lower, 2)
 
+        self.approval_status = QLabel('')
+        self.approval_status.setObjectName('mutedLabel')
+        layout.addWidget(self.approval_status)
+
+        self.approval_progress = QProgressBar()
+        self.approval_progress.setTextVisible(False)
+        self.approval_progress.setVisible(False)
+        self.approval_progress.setFixedHeight(8)
+        layout.addWidget(self.approval_progress)
+
         actions = QHBoxLayout()
+        self.approve_btn = QPushButton('Approve + Embed')
+        self.approve_btn.setIcon(self.style().standardIcon(QStyle.SP_DialogApplyButton))
+        self.approve_btn.setIconSize(QSize(16, 16))
+        self.approve_btn.clicked.connect(self.approve_selected_candidate)
+        actions.addWidget(self.approve_btn)
+
+        self.backup_checkbox = QCheckBox('Backup')
+        self.backup_checkbox.setChecked(bool(self.settings.get('backup_before_embedding', False)))
+        self.backup_checkbox.setToolTip('Save music-file backups before embedding')
+        self.backup_checkbox.toggled.connect(self._save_backup_preference)
+        actions.addWidget(self.backup_checkbox)
+
         self.open_folder_btn = QPushButton('Open Album Folder')
         self.open_folder_btn.setIcon(self.style().standardIcon(QStyle.SP_DirOpenIcon))
+        self.open_folder_btn.setIconSize(QSize(16, 16))
         self.open_folder_btn.clicked.connect(self.open_album_folder)
         self.open_source_btn = QPushButton('Open Source Page')
         self.open_source_btn.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.open_source_btn.setIconSize(QSize(16, 16))
         self.open_source_btn.clicked.connect(self.open_source_page)
         actions.addWidget(self.open_folder_btn)
         actions.addWidget(self.open_source_btn)
@@ -359,6 +415,7 @@ class QtArtworkWindow(QMainWindow):
         if select_first and self.visible_albums:
             self.table.selectRow(0)
         self.statusBar().showMessage(f'Loaded {len(self.albums)} album records')
+        self._refresh_action_states()
 
     def _album_bucket(self, album: Dict[str, Any]) -> str:
         try:
@@ -442,6 +499,7 @@ class QtArtworkWindow(QMainWindow):
         self._load_current_art(album)
         self._load_candidates(album)
         self._render_details()
+        self._refresh_action_states()
 
     def _load_current_art(self, album: Dict[str, Any]) -> None:
         source_file = _first_music_file(album)
@@ -493,6 +551,7 @@ class QtArtworkWindow(QMainWindow):
             self.candidate_list.setCurrentRow(0)
         else:
             self.candidate_panel.set_placeholder('No saved candidate', 'Use the stable app to search artwork')
+        self._refresh_action_states()
 
     def _candidate_label(self, cand: Dict[str, Any]) -> str:
         source = _text(cand.get('source'), 'Artwork')
@@ -520,6 +579,13 @@ class QtArtworkWindow(QMainWindow):
         self.candidate_panel.set_image(cand.get('image_path'), meta)
         self.open_source_btn.setEnabled(bool(_text(cand.get('source_url'))))
         self._render_details(cand)
+        self._refresh_action_states()
+
+    def _selected_candidate(self) -> Optional[Dict[str, Any]]:
+        row = self.candidate_list.currentRow()
+        if 0 <= row < len(self.current_candidates):
+            return self.current_candidates[row]
+        return None
 
     def _render_details(self, candidate: Optional[Dict[str, Any]] = None) -> None:
         album = self.current_album or {}
@@ -553,7 +619,120 @@ class QtArtworkWindow(QMainWindow):
             summary = _text(candidate.get('score_summary'))
             if summary:
                 lines.append('Score summary: ' + summary)
+        if self.last_approval_result and album and self.last_approval_result.get('album_key') == album.get('album_key'):
+            lines.extend([
+                '',
+                'Last approval:',
+                _text(self.last_approval_result.get('final_reason'), '-'),
+                f"Files: {int(self.last_approval_result.get('updated_files') or 0)} / {int(self.last_approval_result.get('total_files') or 0)}",
+            ])
         self.details.setPlainText('\n'.join(lines))
+
+    def _save_backup_preference(self) -> None:
+        try:
+            value = bool(self.backup_checkbox.isChecked())
+            self.settings['backup_before_embedding'] = value
+            save_settings({'backup_before_embedding': value})
+        except Exception:
+            pass
+
+    def _refresh_action_states(self) -> None:
+        has_candidate = self._selected_candidate() is not None
+        busy = self.approval_worker is not None and self.approval_worker.isRunning()
+        self.approve_btn.setEnabled(has_candidate and not busy)
+        self.backup_checkbox.setEnabled(not busy)
+        self.open_folder_btn.setEnabled(bool(self.current_album and _text(self.current_album.get('album_path'))))
+        self.open_source_btn.setEnabled(bool(has_candidate and _text((self._selected_candidate() or {}).get('source_url'))))
+
+    def approve_selected_candidate(self) -> None:
+        candidate = self._selected_candidate()
+        if not candidate:
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        if candidate_needs_warning(candidate, self.settings):
+            answer = QMessageBox.question(
+                self,
+                'Embed lower-confidence artwork?',
+                candidate_warning_text(candidate),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self.statusBar().showMessage('Approval cancelled. Candidate left unchanged.')
+                return
+
+        self.last_approval_result = None
+        backup = bool(self.backup_checkbox.isChecked())
+        self._save_backup_preference()
+        self.approval_status.setText('Preparing embed...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Embedding artwork...')
+
+        worker = ApprovalWorker(candidate, backup, self)
+        worker.progress.connect(self._approval_progress)
+        worker.completed.connect(self._approval_completed)
+        worker.failed.connect(self._approval_failed)
+        worker.finished.connect(lambda w=worker: self._approval_worker_finished(w))
+        self.approval_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
+    def _approval_progress(self, done: int, total: int, path: str) -> None:
+        if total > 0:
+            self.approval_progress.setRange(0, total)
+            self.approval_progress.setValue(max(0, min(done, total)))
+            self.approval_status.setText(f'Embedding {done}/{total}: {_path_tail(path, parts=2)}')
+            self.statusBar().showMessage(f'Embedding {done}/{total}')
+        else:
+            self.approval_progress.setRange(0, 0)
+            self.approval_status.setText(_text(path, 'Embedding artwork...'))
+
+    def _approval_completed(self, result: object) -> None:
+        result = dict(result or {})
+        self.last_approval_result = result
+        self.approval_progress.setVisible(False)
+        complete = bool(result.get('approval_complete'))
+        updated = int(result.get('updated_files') or result.get('updated') or 0)
+        total = int(result.get('total_files') or result.get('total') or 0)
+        if complete:
+            message = f'Approved and embedded artwork into {updated}/{total} file(s).'
+            self.approval_status.setText(message)
+            self.statusBar().showMessage(message)
+        else:
+            message = result.get('final_reason') or 'Approval incomplete; candidate kept for retry.'
+            self.approval_status.setText(message)
+            self.statusBar().showMessage(message)
+            QMessageBox.warning(self, 'Approval incomplete', f'{message}\n\nUpdated {updated}/{total} file(s).')
+        self.reload_queue(select_first=False)
+        self._select_album_key(result.get('album_key'), fallback_first=True)
+
+    def _approval_failed(self, message: str) -> None:
+        self.approval_progress.setVisible(False)
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        QMessageBox.warning(self, 'Cannot approve artwork', message)
+        self._refresh_action_states()
+
+    def _approval_worker_finished(self, worker: ApprovalWorker) -> None:
+        if self.approval_worker is worker:
+            self.approval_worker = None
+        self._refresh_action_states()
+
+    def _select_album_key(self, album_key: Any, *, fallback_first: bool = False) -> bool:
+        key = _text(album_key)
+        if key:
+            for row, album in enumerate(self.visible_albums):
+                if _text(album.get('album_key')) == key:
+                    self.table.selectRow(row)
+                    return True
+        if fallback_first and self.visible_albums:
+            self.table.selectRow(0)
+            return True
+        return False
 
     def open_album_folder(self) -> None:
         album = self.current_album or {}
@@ -572,10 +751,15 @@ class QtArtworkWindow(QMainWindow):
         QMessageBox.information(
             self,
             'Stable app',
-            'This Qt window is read-only. Use the existing Tk app for Scan, Find Artwork, Approve + Embed, and NAS worker actions.',
+            'Use the existing Tk app for Scan, Find Artwork, Convert/Save, bulk maintenance, and NAS worker settings. This Qt prototype can browse the queue and Approve + Embed saved candidates.',
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self.approval_worker is not None:
+            try:
+                self.approval_worker.wait(500)
+            except Exception:
+                pass
         for worker in list(self.current_art_workers):
             try:
                 worker.wait(250)
@@ -661,6 +845,15 @@ class QtArtworkWindow(QMainWindow):
             QPushButton:disabled {
                 color: #9a9aa2;
                 background: #f4f4f6;
+            }
+            QProgressBar {
+                background: #e9e9ef;
+                border: 0;
+                border-radius: 4px;
+            }
+            QProgressBar::chunk {
+                background: #2563eb;
+                border-radius: 4px;
             }
             """
         )
