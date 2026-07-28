@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QSize, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QFont, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -273,6 +273,28 @@ class ImagePanel(QFrame):
         super().resizeEvent(event)
 
 
+class CleanComboBox(QComboBox):
+    """ComboBox with a small painted chevron instead of Qt's bulky arrow box."""
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(30)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor('#687385'))
+        pen.setWidthF(1.8)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        mid_y = self.height() / 2.0
+        right = self.width() - 18
+        painter.drawLine(int(right - 4), int(mid_y - 2), int(right), int(mid_y + 2))
+        painter.drawLine(int(right), int(mid_y + 2), int(right + 4), int(mid_y - 2))
+
+
 class QtArtworkWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -364,7 +386,7 @@ class QtArtworkWindow(QMainWindow):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText('Search artist, album, folder...')
         self.search_edit.textChanged.connect(self.apply_filters)
-        self.filter_combo = QComboBox()
+        self.filter_combo = CleanComboBox()
         self.filter_combo.addItems(FILTERS)
         self.filter_combo.currentTextChanged.connect(self.apply_filters)
         controls.addWidget(self.search_edit, 1)
@@ -1019,6 +1041,36 @@ class QtArtworkWindow(QMainWindow):
                 selection-background-color: #dbeafe;
                 selection-color: #111827;
             }
+            QLineEdit:hover, QComboBox:hover, QTextEdit:hover, QListWidget:hover, QTableWidget:hover {
+                border-color: #c5c9d3;
+            }
+            QLineEdit:focus, QComboBox:focus, QTextEdit:focus, QListWidget:focus, QTableWidget:focus {
+                border-color: #8aa4d6;
+            }
+            QComboBox {
+                padding: 5px 30px 5px 9px;
+            }
+            QComboBox::drop-down {
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+                width: 28px;
+                border: 0;
+                background: transparent;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                width: 0;
+                height: 0;
+            }
+            QComboBox QAbstractItemView {
+                background: #ffffff;
+                border: 1px solid #d9d9df;
+                border-radius: 8px;
+                padding: 4px;
+                outline: 0;
+                selection-background-color: #e7efff;
+                selection-color: #111827;
+            }
             QTableWidget {
                 gridline-color: #ececf1;
             }
@@ -1051,6 +1103,48 @@ class QtArtworkWindow(QMainWindow):
             QProgressBar::chunk {
                 background: #2563eb;
                 border-radius: 4px;
+            }
+            QScrollBar:vertical {
+                background: transparent;
+                width: 10px;
+                margin: 3px 2px 3px 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #c9ced8;
+                border-radius: 5px;
+                min-height: 34px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #aeb6c4;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+                border: 0;
+                background: transparent;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: transparent;
+            }
+            QScrollBar:horizontal {
+                background: transparent;
+                height: 10px;
+                margin: 0 3px 2px 3px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #c9ced8;
+                border-radius: 5px;
+                min-width: 34px;
+            }
+            QScrollBar::handle:horizontal:hover {
+                background: #aeb6c4;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+                width: 0;
+                border: 0;
+                background: transparent;
+            }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+                background: transparent;
             }
             """
         )

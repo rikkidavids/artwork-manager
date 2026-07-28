@@ -1,4 +1,4 @@
-Build 4.57 — Qt search and approve prototype
+Build 4.58 — Qt control polish
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -7,6 +7,7 @@ Build 4.57 — Qt search and approve prototype
 - MacBook-class layouts now give more width to artwork review and allow larger cover previews.
 - Removed generated Python bytecode files from version control.
 - The Qt prototype now supports Find Artwork and Approve + Embed for saved artwork candidates, with progress, optional backups, and post-embed verification.
+- Polished the Qt filter dropdown and scrollbars so the modern UI does not fall back to chunky default controls.
 
 Qt prototype branch
 
