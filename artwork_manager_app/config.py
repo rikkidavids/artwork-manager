@@ -4,7 +4,7 @@ import os
 import shutil
 
 APP_NAME = 'Artwork Review Manager'
-BUILD_VERSION = 'Build 4.65 — Qt chip filter polish'
+BUILD_VERSION = 'Build 4.66 — Qt workflow filter polish'
 MIN_ARTWORK_SIZE = 1000
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
@@ -124,7 +124,7 @@ DEFAULT_SETTINGS = {
     'verbose_log': False,
     'layout': {
         'geometry': '',
-        'queue_filter': 'All',
+        'queue_filter': 'Needs Work',
         'queue_columns': {},
         'qt_main_splitter': [],
         'right_panel_w': 0,

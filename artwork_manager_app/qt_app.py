@@ -51,18 +51,15 @@ from .state import evaluate_album_record, workflow_bucket_for_status
 from .utils import open_path
 
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
-FILTERS = ('All', 'Needs Attention', 'Review', 'Missing', 'Needs Search', 'Not Square', 'Convert', 'Good', 'Handled')
-ACTIONABLE_BUCKETS = {'Review', 'Missing', 'Needs Search', 'Not Square', 'Convert'}
+WORK_BUCKETS = {'Missing', 'Needs Search', 'Not Square', 'Convert'}
+ACTIONABLE_BUCKETS = WORK_BUCKETS | {'Review'}
+DONE_BUCKETS = {'Good', 'Handled'}
+QUEUE_FILTERS = ('Needs Work', 'Review', 'Done', 'All')
 FILTER_CHIPS = (
-    ('All', 'All'),
-    ('Needs Attention', 'Attention'),
+    ('Needs Work', 'Needs Work'),
     ('Review', 'Review'),
-    ('Missing', 'Missing'),
-    ('Needs Search', 'Search'),
-    ('Not Square', 'Square'),
-    ('Convert', 'Convert'),
-    ('Good', 'Good'),
-    ('Handled', 'Handled'),
+    ('Done', 'Done'),
+    ('All', 'All'),
 )
 QUEUE_COLUMNS = ('status', 'artist', 'album', 'current', 'candidates')
 DEFAULT_QUEUE_COLUMN_WIDTHS = {
@@ -527,10 +524,7 @@ class QtArtworkWindow(QMainWindow):
 
         controls = QHBoxLayout()
         saved_layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
-        saved_filter = _text(saved_layout.get('queue_filter'), 'All')
-        if saved_filter not in FILTERS:
-            saved_filter = 'All'
-        self.queue_filter = saved_filter
+        self.queue_filter = self._normalise_queue_filter(saved_layout.get('queue_filter'))
         saved_search = _text(saved_layout.get('queue_search'))
 
         self._restoring_queue_controls = True
@@ -715,9 +709,20 @@ class QtArtworkWindow(QMainWindow):
         self.apply_filters()
         self._schedule_queue_filter_state_save()
 
+    def _normalise_queue_filter(self, filter_name: Any) -> str:
+        filter_name = _text(filter_name, 'All')
+        if filter_name in QUEUE_FILTERS:
+            return filter_name
+        if filter_name in WORK_BUCKETS or filter_name == 'Needs Attention':
+            return 'Needs Work'
+        if filter_name in DONE_BUCKETS:
+            return 'Done'
+        if filter_name == 'Review':
+            return 'Review'
+        return 'All'
+
     def _set_queue_filter(self, filter_name: str) -> None:
-        if filter_name not in FILTERS:
-            return
+        filter_name = self._normalise_queue_filter(filter_name)
         if self.queue_filter == filter_name:
             self._refresh_filter_chips()
             self._schedule_queue_filter_state_save()
@@ -734,7 +739,7 @@ class QtArtworkWindow(QMainWindow):
     def _save_queue_filter_state(self) -> None:
         try:
             search_text = self.search_edit.text() if hasattr(self, 'search_edit') else ''
-            filter_name = self.queue_filter if self.queue_filter in FILTERS else 'All'
+            filter_name = self._normalise_queue_filter(self.queue_filter)
             layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
             layout = dict(layout)
             layout['queue_filter'] = filter_name
@@ -748,7 +753,7 @@ class QtArtworkWindow(QMainWindow):
         if not self.filter_chips:
             return
         counts = counts or self._queue_bucket_counts()
-        selected_filter = self.queue_filter if self.queue_filter in FILTERS else 'All'
+        selected_filter = self._normalise_queue_filter(self.queue_filter)
         for filter_name, label in FILTER_CHIPS:
             chip = self.filter_chips.get(filter_name)
             if chip is None:
@@ -759,28 +764,40 @@ class QtArtworkWindow(QMainWindow):
             chip.blockSignals(False)
 
     def _queue_bucket_counts(self) -> Dict[str, int]:
-        counts = {name: 0 for name in FILTERS}
+        counts = {name: 0 for name in QUEUE_FILTERS}
         counts['All'] = len(self.albums)
         for album in self.albums:
             bucket = self._album_bucket(album)
-            counts[bucket] = counts.get(bucket, 0) + 1
-            if bucket in ACTIONABLE_BUCKETS:
-                counts['Needs Attention'] = counts.get('Needs Attention', 0) + 1
+            if bucket in WORK_BUCKETS:
+                counts['Needs Work'] = counts.get('Needs Work', 0) + 1
+            elif bucket == 'Review':
+                counts['Review'] = counts.get('Review', 0) + 1
+            elif bucket in DONE_BUCKETS:
+                counts['Done'] = counts.get('Done', 0) + 1
         return counts
 
     def apply_filters(self) -> None:
         query = self.search_edit.text().strip().lower() if hasattr(self, 'search_edit') else ''
-        selected_filter = self.queue_filter if self.queue_filter in FILTERS else 'All'
+        selected_filter = self._normalise_queue_filter(self.queue_filter)
         visible = []
-        counts = {name: 0 for name in FILTERS}
+        counts = {name: 0 for name in QUEUE_FILTERS}
         counts['All'] = len(self.albums)
         for album in self.albums:
             bucket = self._album_bucket(album)
-            counts[bucket] = counts.get(bucket, 0) + 1
-            if bucket in ACTIONABLE_BUCKETS:
-                counts['Needs Attention'] = counts.get('Needs Attention', 0) + 1
-            if selected_filter == 'Needs Attention':
-                if bucket not in ACTIONABLE_BUCKETS:
+            if bucket in WORK_BUCKETS:
+                counts['Needs Work'] = counts.get('Needs Work', 0) + 1
+            elif bucket == 'Review':
+                counts['Review'] = counts.get('Review', 0) + 1
+            elif bucket in DONE_BUCKETS:
+                counts['Done'] = counts.get('Done', 0) + 1
+            if selected_filter == 'Needs Work':
+                if bucket not in WORK_BUCKETS:
+                    continue
+            elif selected_filter == 'Review':
+                if bucket != 'Review':
+                    continue
+            elif selected_filter == 'Done':
+                if bucket not in DONE_BUCKETS:
                     continue
             elif selected_filter != 'All' and bucket != selected_filter:
                 continue
@@ -1584,6 +1601,13 @@ class QtArtworkWindow(QMainWindow):
                 color: #17345c;
             }
             QPushButton:disabled {
+                color: #9a9aa2;
+                background: #f4f4f6;
+                border-color: #d9d9df;
+            }
+            QPushButton#primaryButton:disabled,
+            QPushButton#approveButton:disabled,
+            QPushButton#dangerButton:disabled {
                 color: #9a9aa2;
                 background: #f4f4f6;
                 border-color: #d9d9df;
