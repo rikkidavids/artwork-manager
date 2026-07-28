@@ -1,0 +1,2 @@
+-r artwork_manager_app/requirements.txt
+PySide6>=6.6
