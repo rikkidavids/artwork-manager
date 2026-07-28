@@ -19,7 +19,6 @@ from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QPainter, QPen,
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QComboBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -62,6 +61,8 @@ FILTER_CHIPS = (
     ('Needs Search', 'Search'),
     ('Not Square', 'Square'),
     ('Convert', 'Convert'),
+    ('Good', 'Good'),
+    ('Handled', 'Handled'),
 )
 QUEUE_COLUMNS = ('status', 'artist', 'album', 'current', 'candidates')
 DEFAULT_QUEUE_COLUMN_WIDTHS = {
@@ -420,28 +421,6 @@ class ElidedLabel(QLabel):
         painter.end()
 
 
-class CleanComboBox(QComboBox):
-    """ComboBox with a small painted chevron instead of Qt's bulky arrow box."""
-
-    def __init__(self):
-        super().__init__()
-        self.setMinimumHeight(30)
-
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        pen = QPen(QColor('#687385'))
-        pen.setWidthF(1.8)
-        pen.setCapStyle(Qt.RoundCap)
-        pen.setJoinStyle(Qt.RoundJoin)
-        painter.setPen(pen)
-        mid_y = self.height() / 2.0
-        right = self.width() - 18
-        painter.drawLine(int(right - 4), int(mid_y - 2), int(right), int(mid_y + 2))
-        painter.drawLine(int(right), int(mid_y + 2), int(right + 4), int(mid_y - 2))
-
-
 class QtArtworkWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -450,6 +429,7 @@ class QtArtworkWindow(QMainWindow):
         self.visible_albums: List[Dict[str, Any]] = []
         self.current_album: Optional[Dict[str, Any]] = None
         self.current_candidates: List[Dict[str, Any]] = []
+        self.queue_filter = 'All'
         self.filter_chips: Dict[str, QPushButton] = {}
         self.current_art_worker: Optional[CurrentArtWorker] = None
         self.current_art_workers: List[CurrentArtWorker] = []
@@ -550,20 +530,16 @@ class QtArtworkWindow(QMainWindow):
         saved_filter = _text(saved_layout.get('queue_filter'), 'All')
         if saved_filter not in FILTERS:
             saved_filter = 'All'
+        self.queue_filter = saved_filter
         saved_search = _text(saved_layout.get('queue_search'))
 
         self._restoring_queue_controls = True
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText('Search artist, album, folder...')
         self.search_edit.setText(saved_search)
-        self.filter_combo = CleanComboBox()
-        self.filter_combo.addItems(FILTERS)
-        self.filter_combo.setCurrentText(saved_filter)
         self._restoring_queue_controls = False
         self.search_edit.textChanged.connect(self._queue_search_changed)
-        self.filter_combo.currentTextChanged.connect(self._queue_filter_changed)
         controls.addWidget(self.search_edit, 1)
-        controls.addWidget(self.filter_combo)
         layout.addLayout(controls)
 
         chips = QHBoxLayout()
@@ -739,18 +715,16 @@ class QtArtworkWindow(QMainWindow):
         self.apply_filters()
         self._schedule_queue_filter_state_save()
 
-    def _queue_filter_changed(self, _filter_name: str = '') -> None:
-        self.apply_filters()
-        self._schedule_queue_filter_state_save()
-
     def _set_queue_filter(self, filter_name: str) -> None:
         if filter_name not in FILTERS:
             return
-        if self.filter_combo.currentText() == filter_name:
+        if self.queue_filter == filter_name:
             self._refresh_filter_chips()
             self._schedule_queue_filter_state_save()
             return
-        self.filter_combo.setCurrentText(filter_name)
+        self.queue_filter = filter_name
+        self.apply_filters()
+        self._schedule_queue_filter_state_save()
 
     def _schedule_queue_filter_state_save(self) -> None:
         if self._restoring_queue_controls:
@@ -760,7 +734,7 @@ class QtArtworkWindow(QMainWindow):
     def _save_queue_filter_state(self) -> None:
         try:
             search_text = self.search_edit.text() if hasattr(self, 'search_edit') else ''
-            filter_name = self.filter_combo.currentText() if hasattr(self, 'filter_combo') else 'All'
+            filter_name = self.queue_filter if self.queue_filter in FILTERS else 'All'
             layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
             layout = dict(layout)
             layout['queue_filter'] = filter_name
@@ -774,7 +748,7 @@ class QtArtworkWindow(QMainWindow):
         if not self.filter_chips:
             return
         counts = counts or self._queue_bucket_counts()
-        selected_filter = self.filter_combo.currentText() if hasattr(self, 'filter_combo') else 'All'
+        selected_filter = self.queue_filter if self.queue_filter in FILTERS else 'All'
         for filter_name, label in FILTER_CHIPS:
             chip = self.filter_chips.get(filter_name)
             if chip is None:
@@ -796,7 +770,7 @@ class QtArtworkWindow(QMainWindow):
 
     def apply_filters(self) -> None:
         query = self.search_edit.text().strip().lower() if hasattr(self, 'search_edit') else ''
-        selected_filter = self.filter_combo.currentText() if hasattr(self, 'filter_combo') else 'All'
+        selected_filter = self.queue_filter if self.queue_filter in FILTERS else 'All'
         visible = []
         counts = {name: 0 for name in FILTERS}
         counts['All'] = len(self.albums)
@@ -1184,7 +1158,7 @@ class QtArtworkWindow(QMainWindow):
 
     def _focus_is_text_entry(self) -> bool:
         widget = QApplication.focusWidget()
-        return isinstance(widget, (QLineEdit, QTextEdit, QComboBox))
+        return isinstance(widget, (QLineEdit, QTextEdit))
 
     def _focus_queue_search(self) -> None:
         self.search_edit.setFocus(Qt.ShortcutFocusReason)
@@ -1508,7 +1482,7 @@ class QtArtworkWindow(QMainWindow):
                 border-radius: 4px;
                 color: #777b84;
             }
-            QLineEdit, QComboBox, QTextEdit, QListWidget, QTableWidget {
+            QLineEdit, QTextEdit, QListWidget, QTableWidget {
                 background: #ffffff;
                 border: 1px solid #d9d9df;
                 border-radius: 6px;
@@ -1516,35 +1490,11 @@ class QtArtworkWindow(QMainWindow):
                 selection-background-color: #dbeafe;
                 selection-color: #111827;
             }
-            QLineEdit:hover, QComboBox:hover, QTextEdit:hover, QListWidget:hover, QTableWidget:hover {
+            QLineEdit:hover, QTextEdit:hover, QListWidget:hover, QTableWidget:hover {
                 border-color: #c5c9d3;
             }
-            QLineEdit:focus, QComboBox:focus, QTextEdit:focus, QListWidget:focus, QTableWidget:focus {
+            QLineEdit:focus, QTextEdit:focus, QListWidget:focus, QTableWidget:focus {
                 border-color: #8aa4d6;
-            }
-            QComboBox {
-                padding: 5px 30px 5px 9px;
-            }
-            QComboBox::drop-down {
-                subcontrol-origin: padding;
-                subcontrol-position: top right;
-                width: 28px;
-                border: 0;
-                background: transparent;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                width: 0;
-                height: 0;
-            }
-            QComboBox QAbstractItemView {
-                background: #ffffff;
-                border: 1px solid #d9d9df;
-                border-radius: 8px;
-                padding: 4px;
-                outline: 0;
-                selection-background-color: #e7efff;
-                selection-color: #111827;
             }
             QTableWidget {
                 gridline-color: transparent;

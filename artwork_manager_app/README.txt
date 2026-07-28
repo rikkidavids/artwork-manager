@@ -1,4 +1,4 @@
-Build 4.64 — Qt modern review polish
+Build 4.65 — Qt chip filter polish
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -16,6 +16,7 @@ Build 4.64 — Qt modern review polish
 - Added clickable queue count filters for the main review buckets, with saved search/filter state.
 - Added Qt keyboard flow for Cmd-F queue search, F Find Artwork, A Approve + Embed, and N next actionable album.
 - Artwork preview canvases now stay square, and review copy/log output is quieter for a cleaner modern layout.
+- Removed the duplicate Qt queue filter dropdown; all queue views now use the count chips.
 
 Qt prototype branch
 
