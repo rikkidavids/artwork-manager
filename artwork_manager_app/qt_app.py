@@ -14,7 +14,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PySide6.QtCore import QRectF, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -53,6 +53,16 @@ from .utils import open_path
 
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 FILTERS = ('All', 'Needs Attention', 'Review', 'Missing', 'Needs Search', 'Not Square', 'Convert', 'Good', 'Handled')
+ACTIONABLE_BUCKETS = {'Review', 'Missing', 'Needs Search', 'Not Square', 'Convert'}
+FILTER_CHIPS = (
+    ('All', 'All'),
+    ('Needs Attention', 'Attention'),
+    ('Review', 'Review'),
+    ('Missing', 'Missing'),
+    ('Needs Search', 'Search'),
+    ('Not Square', 'Square'),
+    ('Convert', 'Convert'),
+)
 QUEUE_COLUMNS = ('status', 'artist', 'album', 'current', 'candidates')
 DEFAULT_QUEUE_COLUMN_WIDTHS = {
     'status': 96,
@@ -292,16 +302,29 @@ class SearchWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class SquareArtworkLabel(QLabel):
+    def __init__(self, text: str = ''):
+        super().__init__(text)
+        self.setMinimumSize(180, 180)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt naming
+        return QSize(320, 320)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt naming
+        return QSize(180, 180)
+
+
 class ImagePanel(QFrame):
     def __init__(self, title: str):
         super().__init__()
         self.setObjectName('imagePanel')
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._syncing_square = False
         self.title_label = QLabel(title)
         self.title_label.setObjectName('panelTitle')
-        self.image_label = QLabel('No artwork')
+        self.image_label = SquareArtworkLabel('No artwork')
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(260, 260)
         self.image_label.setObjectName('artworkPreview')
         self.meta_label = QLabel('')
         self.meta_label.setObjectName('mutedLabel')
@@ -311,8 +334,11 @@ class ImagePanel(QFrame):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
         layout.addWidget(self.title_label)
-        layout.addWidget(self.image_label, 1)
+        layout.addStretch(1)
+        layout.addWidget(self.image_label, 0, Qt.AlignHCenter)
+        layout.addStretch(1)
         layout.addWidget(self.meta_label)
+        QTimer.singleShot(0, self._sync_preview_square)
 
     def set_placeholder(self, text: str, meta: str = '') -> None:
         self.image_label.setText(text)
@@ -324,6 +350,7 @@ class ImagePanel(QFrame):
         if not pix:
             self.set_placeholder('No artwork', meta)
             return False
+        self._sync_preview_square()
         target = self.image_label.size()
         scaled = pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.image_label.setText('')
@@ -332,7 +359,26 @@ class ImagePanel(QFrame):
         self.meta_label.setText(meta)
         return True
 
+    def _sync_preview_square(self) -> None:
+        if self._syncing_square:
+            return
+        self._syncing_square = True
+        try:
+            margins = self.layout().contentsMargins()
+            spacing = self.layout().spacing()
+            title_h = self.title_label.sizeHint().height()
+            meta_h = self.meta_label.sizeHint().height()
+            available_w = max(120, self.width() - margins.left() - margins.right())
+            available_h = max(120, self.height() - margins.top() - margins.bottom() - title_h - meta_h - (spacing * 4))
+            side = max(180, min(available_w, available_h))
+            size = QSize(side, side)
+            if self.image_label.size() != size:
+                self.image_label.setFixedSize(size)
+        finally:
+            self._syncing_square = False
+
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._sync_preview_square()
         pix = self.image_label.property('sourcePixmap')
         if isinstance(pix, QPixmap) and not pix.isNull():
             scaled = pix.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -404,6 +450,7 @@ class QtArtworkWindow(QMainWindow):
         self.visible_albums: List[Dict[str, Any]] = []
         self.current_album: Optional[Dict[str, Any]] = None
         self.current_candidates: List[Dict[str, Any]] = []
+        self.filter_chips: Dict[str, QPushButton] = {}
         self.current_art_worker: Optional[CurrentArtWorker] = None
         self.current_art_workers: List[CurrentArtWorker] = []
         self.approval_worker: Optional[ApprovalWorker] = None
@@ -411,8 +458,12 @@ class QtArtworkWindow(QMainWindow):
         self.last_approval_result: Optional[Dict[str, Any]] = None
         self.last_search_log: List[str] = []
         self.pending_approval_row = 0
+        self._restoring_queue_controls = False
         self._restoring_queue_columns = False
         self._restoring_main_splitter = False
+        self.queue_filter_save_timer = QTimer(self)
+        self.queue_filter_save_timer.setSingleShot(True)
+        self.queue_filter_save_timer.timeout.connect(self._save_queue_filter_state)
         self.queue_column_save_timer = QTimer(self)
         self.queue_column_save_timer.setSingleShot(True)
         self.queue_column_save_timer.timeout.connect(self._save_queue_column_widths)
@@ -427,6 +478,7 @@ class QtArtworkWindow(QMainWindow):
         self._build_actions()
         self._build_ui()
         self._apply_style()
+        QApplication.instance().installEventFilter(self)
         self.reload_queue(select_first=True)
 
     def _build_actions(self) -> None:
@@ -442,14 +494,14 @@ class QtArtworkWindow(QMainWindow):
         refresh.triggered.connect(lambda: self.reload_queue(select_first=False))
         toolbar.addAction(refresh)
 
-        open_tk = QAction(_line_icon('app'), 'Open Stable Tk App', self)
-        open_tk.setToolTip('Show where write actions still live')
+        open_tk = QAction(_line_icon('app'), 'Stable App', self)
+        open_tk.setToolTip('Open the stable app for scan and settings tools')
         open_tk.triggered.connect(self._show_tk_hint)
         toolbar.addAction(open_tk)
 
         toolbar.addSeparator()
 
-        readonly = QLabel('Qt prototype')
+        readonly = QLabel('Qt')
         readonly.setObjectName('readonlyPill')
         toolbar.addWidget(readonly)
 
@@ -494,15 +546,40 @@ class QtArtworkWindow(QMainWindow):
         layout.addLayout(title_row)
 
         controls = QHBoxLayout()
+        saved_layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
+        saved_filter = _text(saved_layout.get('queue_filter'), 'All')
+        if saved_filter not in FILTERS:
+            saved_filter = 'All'
+        saved_search = _text(saved_layout.get('queue_search'))
+
+        self._restoring_queue_controls = True
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText('Search artist, album, folder...')
-        self.search_edit.textChanged.connect(self.apply_filters)
+        self.search_edit.setText(saved_search)
         self.filter_combo = CleanComboBox()
         self.filter_combo.addItems(FILTERS)
-        self.filter_combo.currentTextChanged.connect(self.apply_filters)
+        self.filter_combo.setCurrentText(saved_filter)
+        self._restoring_queue_controls = False
+        self.search_edit.textChanged.connect(self._queue_search_changed)
+        self.filter_combo.currentTextChanged.connect(self._queue_filter_changed)
         controls.addWidget(self.search_edit, 1)
         controls.addWidget(self.filter_combo)
         layout.addLayout(controls)
+
+        chips = QHBoxLayout()
+        chips.setSpacing(4)
+        for filter_name, label in FILTER_CHIPS:
+            chip = QPushButton(label)
+            chip.setObjectName('filterChip')
+            chip.setCheckable(True)
+            chip.setMinimumWidth(0)
+            chip.setMinimumHeight(28)
+            chip.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            chip.clicked.connect(lambda _checked=False, name=filter_name: self._set_queue_filter(name))
+            chips.addWidget(chip)
+            self.filter_chips[filter_name] = chip
+        chips.addStretch(1)
+        layout.addLayout(chips)
 
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(['Status', 'Artist', 'Album', 'Size', 'Opts'])
@@ -511,6 +588,7 @@ class QtArtworkWindow(QMainWindow):
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setTextElideMode(Qt.ElideRight)
+        self.table.setWordWrap(False)
         self.table.setShowGrid(False)
         self.table.setCornerButtonEnabled(False)
         self.table.verticalHeader().setVisible(False)
@@ -566,6 +644,7 @@ class QtArtworkWindow(QMainWindow):
         self.details.setReadOnly(True)
         self.details.setObjectName('detailsText')
         self.details.setLineWrapMode(QTextEdit.WidgetWidth)
+        self.details.setPlaceholderText('Select an album to review.')
         lower.addWidget(self.details)
         lower.setSizes([320, 560])
         layout.addWidget(lower, 2)
@@ -656,14 +735,78 @@ class QtArtworkWindow(QMainWindow):
         except Exception:
             return album.get('status') or '', ''
 
+    def _queue_search_changed(self, _text_value: str = '') -> None:
+        self.apply_filters()
+        self._schedule_queue_filter_state_save()
+
+    def _queue_filter_changed(self, _filter_name: str = '') -> None:
+        self.apply_filters()
+        self._schedule_queue_filter_state_save()
+
+    def _set_queue_filter(self, filter_name: str) -> None:
+        if filter_name not in FILTERS:
+            return
+        if self.filter_combo.currentText() == filter_name:
+            self._refresh_filter_chips()
+            self._schedule_queue_filter_state_save()
+            return
+        self.filter_combo.setCurrentText(filter_name)
+
+    def _schedule_queue_filter_state_save(self) -> None:
+        if self._restoring_queue_controls:
+            return
+        self.queue_filter_save_timer.start(350)
+
+    def _save_queue_filter_state(self) -> None:
+        try:
+            search_text = self.search_edit.text() if hasattr(self, 'search_edit') else ''
+            filter_name = self.filter_combo.currentText() if hasattr(self, 'filter_combo') else 'All'
+            layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
+            layout = dict(layout)
+            layout['queue_filter'] = filter_name
+            layout['queue_search'] = search_text
+            self.settings['layout'] = layout
+            save_settings({'layout': {'queue_filter': filter_name, 'queue_search': search_text}})
+        except Exception:
+            pass
+
+    def _refresh_filter_chips(self, counts: Optional[Dict[str, int]] = None) -> None:
+        if not self.filter_chips:
+            return
+        counts = counts or self._queue_bucket_counts()
+        selected_filter = self.filter_combo.currentText() if hasattr(self, 'filter_combo') else 'All'
+        for filter_name, label in FILTER_CHIPS:
+            chip = self.filter_chips.get(filter_name)
+            if chip is None:
+                continue
+            chip.blockSignals(True)
+            chip.setText(f'{label} {int(counts.get(filter_name, 0)):,}')
+            chip.setChecked(filter_name == selected_filter)
+            chip.blockSignals(False)
+
+    def _queue_bucket_counts(self) -> Dict[str, int]:
+        counts = {name: 0 for name in FILTERS}
+        counts['All'] = len(self.albums)
+        for album in self.albums:
+            bucket = self._album_bucket(album)
+            counts[bucket] = counts.get(bucket, 0) + 1
+            if bucket in ACTIONABLE_BUCKETS:
+                counts['Needs Attention'] = counts.get('Needs Attention', 0) + 1
+        return counts
+
     def apply_filters(self) -> None:
         query = self.search_edit.text().strip().lower() if hasattr(self, 'search_edit') else ''
         selected_filter = self.filter_combo.currentText() if hasattr(self, 'filter_combo') else 'All'
         visible = []
+        counts = {name: 0 for name in FILTERS}
+        counts['All'] = len(self.albums)
         for album in self.albums:
             bucket = self._album_bucket(album)
+            counts[bucket] = counts.get(bucket, 0) + 1
+            if bucket in ACTIONABLE_BUCKETS:
+                counts['Needs Attention'] = counts.get('Needs Attention', 0) + 1
             if selected_filter == 'Needs Attention':
-                if bucket not in {'Needs Search', 'Missing', 'Not Square', 'Convert'}:
+                if bucket not in ACTIONABLE_BUCKETS:
                     continue
             elif selected_filter != 'All' and bucket != selected_filter:
                 continue
@@ -680,6 +823,7 @@ class QtArtworkWindow(QMainWindow):
         visible.sort(key=lambda item: (self._sort_bucket(item), _text(item.get('artist')).lower(), _text(item.get('album')).lower()))
         self.visible_albums = visible
         self._render_table()
+        self._refresh_filter_chips(counts)
 
     def _sort_bucket(self, album: Dict[str, Any]) -> int:
         order = {'Review': 0, 'Missing': 1, 'Needs Search': 2, 'Not Square': 3, 'Convert': 4, 'Good': 5, 'Handled': 6}
@@ -886,7 +1030,7 @@ class QtArtworkWindow(QMainWindow):
         if self.current_candidates:
             self.candidate_list.setCurrentRow(0)
         else:
-            self.candidate_panel.set_placeholder('No saved candidate', 'Use the stable app to search artwork')
+            self.candidate_panel.set_placeholder('No candidate artwork')
         self._refresh_action_states()
 
     def _candidate_label(self, cand: Dict[str, Any]) -> str:
@@ -982,8 +1126,10 @@ class QtArtworkWindow(QMainWindow):
                 f"Files: {int(self.last_approval_result.get('updated_files') or 0)} / {int(self.last_approval_result.get('total_files') or 0)}",
             ])
         if self.last_search_log:
-            lines.extend(['', 'Search log:'])
-            lines.extend(self.last_search_log[-8:])
+            recent = [_text(line) for line in self.last_search_log[-3:] if _text(line)]
+            if recent:
+                lines.extend(['', 'Recent search:'])
+                lines.extend(recent)
         self.details.setPlainText('\n'.join(lines))
 
     def _save_backup_preference(self) -> None:
@@ -1009,6 +1155,50 @@ class QtArtworkWindow(QMainWindow):
         self.backup_checkbox.setEnabled(not busy)
         self.open_folder_btn.setEnabled(bool(self.current_album and _text(self.current_album.get('album_path'))))
         self.open_source_btn.setEnabled(bool(has_candidate and _text((self._selected_candidate() or {}).get('source_url'))))
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt naming
+        try:
+            if event.type() == QEvent.Type.KeyPress and self.isActiveWindow():
+                key = event.key()
+                modifiers = event.modifiers()
+                command_pressed = bool(modifiers & Qt.ControlModifier) or bool(modifiers & Qt.MetaModifier)
+                if key == Qt.Key_F and command_pressed:
+                    self._focus_queue_search()
+                    return True
+                if modifiers & (Qt.ControlModifier | Qt.MetaModifier | Qt.AltModifier):
+                    return super().eventFilter(watched, event)
+                if self._focus_is_text_entry():
+                    return super().eventFilter(watched, event)
+                if key == Qt.Key_F and self.find_btn.isEnabled():
+                    self.find_artwork_for_selected_album()
+                    return True
+                if key == Qt.Key_A and self.approve_btn.isEnabled():
+                    self.approve_selected_candidate()
+                    return True
+                if key == Qt.Key_N:
+                    self._select_next_actionable_from_current()
+                    return True
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
+
+    def _focus_is_text_entry(self) -> bool:
+        widget = QApplication.focusWidget()
+        return isinstance(widget, (QLineEdit, QTextEdit, QComboBox))
+
+    def _focus_queue_search(self) -> None:
+        self.search_edit.setFocus(Qt.ShortcutFocusReason)
+        self.search_edit.selectAll()
+
+    def _select_next_actionable_from_current(self) -> bool:
+        if not self.visible_albums:
+            return False
+        current_row = self.table.currentRow()
+        start_row = current_row + 1 if current_row >= 0 else 0
+        selected = self._select_next_actionable_row(start_row=start_row)
+        if not selected:
+            self.statusBar().showMessage('No actionable albums in the current queue.')
+        return selected
 
     def find_artwork_for_selected_album(self) -> None:
         info = self._album_to_search_info(self.current_album)
@@ -1197,11 +1387,10 @@ class QtArtworkWindow(QMainWindow):
     def _select_next_actionable_row(self, *, start_row: int = 0) -> bool:
         if not self.visible_albums:
             return False
-        actionable = {'Review', 'Missing', 'Needs Search', 'Not Square', 'Convert'}
         start = max(0, min(int(start_row or 0), len(self.visible_albums) - 1))
         for offset in range(len(self.visible_albums)):
             row = (start + offset) % len(self.visible_albums)
-            if self._album_bucket(self.visible_albums[row]) in actionable:
+            if self._album_bucket(self.visible_albums[row]) in ACTIONABLE_BUCKETS:
                 self.table.selectRow(row)
                 return True
         self.table.selectRow(0)
@@ -1228,12 +1417,19 @@ class QtArtworkWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self.queue_filter_save_timer.isActive():
+            self.queue_filter_save_timer.stop()
+            self._save_queue_filter_state()
         if self.queue_column_save_timer.isActive():
             self.queue_column_save_timer.stop()
             self._save_queue_column_widths()
         if self.main_splitter_save_timer.isActive():
             self.main_splitter_save_timer.stop()
             self._save_main_splitter_sizes()
+        try:
+            QApplication.instance().removeEventFilter(self)
+        except Exception:
+            pass
         if self.search_worker is not None:
             try:
                 self.search_worker.stop()
@@ -1288,8 +1484,8 @@ class QtArtworkWindow(QMainWindow):
             }
             QFrame#sidebar, QFrame#imagePanel {
                 background: #ffffff;
-                border: 1px solid #dedee4;
-                border-radius: 8px;
+                border: 1px solid #e0e3ea;
+                border-radius: 6px;
             }
             QLabel#sectionTitle {
                 font-size: 18px;
@@ -1307,9 +1503,9 @@ class QtArtworkWindow(QMainWindow):
                 color: #666a73;
             }
             QLabel#artworkPreview {
-                background: #fafafa;
-                border: 1px solid #e0e0e5;
-                border-radius: 6px;
+                background: #ffffff;
+                border: 1px solid #dfe3eb;
+                border-radius: 4px;
                 color: #777b84;
             }
             QLineEdit, QComboBox, QTextEdit, QListWidget, QTableWidget {
@@ -1418,6 +1614,24 @@ class QtArtworkWindow(QMainWindow):
             }
             QPushButton#quietButton {
                 background: #fbfbfd;
+            }
+            QPushButton#filterChip {
+                background: #fbfbfd;
+                border: 1px solid #d7dce6;
+                border-radius: 6px;
+                color: #485465;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 5px 7px;
+            }
+            QPushButton#filterChip:hover {
+                background: #f0f4ff;
+                border-color: #b7c5df;
+            }
+            QPushButton#filterChip:checked {
+                background: #e7f0ff;
+                border-color: #8aa4d6;
+                color: #17345c;
             }
             QPushButton:disabled {
                 color: #9a9aa2;

@@ -1,4 +1,4 @@
-Build 4.62 — Qt layout stability polish
+Build 4.64 — Qt modern review polish
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -13,6 +13,9 @@ Build 4.62 — Qt layout stability polish
 - After a successful Qt approve/embed, the review pane advances to the next actionable queue item.
 - Long selected album names now truncate instead of pushing the queue/artwork layout around.
 - The Qt queue/review divider is remembered, and Backup before embed moved out of the bottom action row.
+- Added clickable queue count filters for the main review buckets, with saved search/filter state.
+- Added Qt keyboard flow for Cmd-F queue search, F Find Artwork, A Approve + Embed, and N next actionable album.
+- Artwork preview canvases now stay square, and review copy/log output is quieter for a cleaner modern layout.
 
 Qt prototype branch
 
