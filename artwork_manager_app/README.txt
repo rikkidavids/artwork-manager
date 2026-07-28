@@ -17,4 +17,5 @@ Qt prototype branch
 - Install prototype dependencies with: python3.11 -m pip install -r requirements-qt.txt
 - Run it with: python3.11 -m artwork_manager_app.run_qt_app
 - Or double-click Run Qt Prototype.command to create/update its Qt environment and launch it.
+- Or double-click Update and Run Artwork Manager.command to pull the latest qt-prototype changes, update dependencies, and launch.
 - The stable Tk app remains the full app for Scan, Convert/Save, bulk maintenance, and NAS worker settings.
