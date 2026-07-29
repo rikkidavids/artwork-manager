@@ -1,4 +1,4 @@
-Build 4.82 — Qt reject all cleanup
+Build 4.83 — Qt artwork preview
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -41,6 +41,7 @@ Build 4.82 — Qt reject all cleanup
 - Added Qt Convert/Save Next in the More menu, processing the next visible Square/Convert albums in the same order and batch size as Search Next.
 - Search Next now focuses on Missing/Needs Search albums, leaving Square/Convert cleanup to the new Convert/Save actions.
 - Added Qt Reject All Options and app-managed temporary artwork cleanup after approve, reject, skip, mark-good, ignore, and rework actions.
+- Added click/double-click/Space artwork previews in Qt for larger current and candidate cover inspection.
 
 Qt review branch
 

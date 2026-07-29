@@ -307,6 +307,8 @@ def _provider_for_release_source(source: str):
 
 
 def _image_pixmap(source: Any) -> Optional[QPixmap]:
+    if isinstance(source, QPixmap):
+        return QPixmap(source) if not source.isNull() else None
     pix = QPixmap()
     if isinstance(source, (bytes, bytearray)):
         if pix.loadFromData(bytes(source)):
@@ -1369,11 +1371,14 @@ class SquareArtworkLabel(QLabel):
 
 
 class ImagePanel(QFrame):
+    clicked = Signal()
+
     def __init__(self, title: str):
         super().__init__()
         self.setObjectName('imagePanel')
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._syncing_square = False
+        self.setCursor(Qt.ArrowCursor)
         self.title_label = QLabel(title)
         self.title_label.setObjectName('panelTitle')
         self.image_label = SquareArtworkLabel('No artwork')
@@ -1398,6 +1403,8 @@ class ImagePanel(QFrame):
         self.image_label.setPixmap(QPixmap())
         self.image_label.setProperty('sourcePixmap', None)
         self.meta_label.setText(meta)
+        self.setCursor(Qt.ArrowCursor)
+        self.setToolTip('')
 
     def set_image(self, source: Any, meta: str = '') -> bool:
         pix = _image_pixmap(source)
@@ -1411,7 +1418,22 @@ class ImagePanel(QFrame):
         self.image_label.setPixmap(scaled)
         self.image_label.setProperty('sourcePixmap', pix)
         self.meta_label.setText(meta)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip('Open artwork preview')
         return True
+
+    def source_pixmap(self) -> Optional[QPixmap]:
+        pix = self.image_label.property('sourcePixmap')
+        if isinstance(pix, QPixmap) and not pix.isNull():
+            return pix
+        return None
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.button() == Qt.LeftButton and self.source_pixmap() is not None:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def _sync_preview_square(self) -> None:
         if self._syncing_square:
@@ -1472,6 +1494,66 @@ class ElidedLabel(QLabel):
         text = self.fontMetrics().elidedText(self._full_text, self.elide_mode, max(0, rect.width()))
         painter.drawText(rect, self.alignment() | Qt.AlignVCenter, text)
         painter.end()
+
+
+class ArtworkPreviewDialog(QDialog):
+    def __init__(self, pixmap: QPixmap, title: str, meta: str = '', parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName('artworkPreviewDialog')
+        self.setWindowTitle(_text(title, 'Artwork Preview'))
+        self.source_pixmap = QPixmap(pixmap)
+        self.resize(760, 820)
+        self.setMinimumSize(420, 500)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        self.title_label = ElidedLabel(_text(title, 'Artwork Preview'))
+        self.title_label.setObjectName('albumTitle')
+        self.title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.title_label)
+
+        self.image_label = SquareArtworkLabel('')
+        self.image_label.setObjectName('previewImage')
+        self.image_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.image_label, 1, Qt.AlignCenter)
+
+        self.meta_label = QLabel(_text(meta))
+        self.meta_label.setObjectName('mutedLabel')
+        self.meta_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.meta_label)
+        QTimer.singleShot(0, self._sync_image)
+
+    def _sync_image(self) -> None:
+        if self.source_pixmap.isNull():
+            self.image_label.setText('Preview unavailable')
+            return
+        margins = self.layout().contentsMargins()
+        spacing = self.layout().spacing()
+        available_w = max(240, self.width() - margins.left() - margins.right())
+        available_h = max(
+            240,
+            self.height()
+            - margins.top()
+            - margins.bottom()
+            - self.title_label.sizeHint().height()
+            - self.meta_label.sizeHint().height()
+            - (spacing * 2),
+        )
+        side = max(240, min(available_w, available_h))
+        self.image_label.setFixedSize(side, side)
+        self.image_label.setPixmap(self.source_pixmap.scaled(self.image_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._sync_image()
+        super().resizeEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.key() in (Qt.Key_Escape, Qt.Key_Space):
+            self.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class CandidateOptionWidget(QFrame):
@@ -2030,6 +2112,8 @@ class QtArtworkWindow(QMainWindow):
         image_grid.setSpacing(12)
         self.current_panel = ImagePanel('Current')
         self.candidate_panel = ImagePanel('Candidate')
+        self.current_panel.clicked.connect(self.open_current_artwork_preview)
+        self.candidate_panel.clicked.connect(self.open_candidate_artwork_preview)
         image_grid.addWidget(self.current_panel, 0, 0)
         image_grid.addWidget(self.candidate_panel, 0, 1)
         image_grid.setColumnStretch(0, 1)
@@ -2044,6 +2128,7 @@ class QtArtworkWindow(QMainWindow):
         self.candidate_list.setSpacing(2)
         self.candidate_list.setTextElideMode(Qt.ElideRight)
         self.candidate_list.currentRowChanged.connect(self._select_candidate)
+        self.candidate_list.itemDoubleClicked.connect(lambda _item=None: self.open_candidate_artwork_preview())
         lower.addWidget(self.candidate_list)
 
         self.details = QTextEdit()
@@ -2649,6 +2734,40 @@ class QtArtworkWindow(QMainWindow):
         if self.current_art_worker is worker:
             self.current_art_worker = self.current_art_workers[-1] if self.current_art_workers else None
 
+    def _open_artwork_preview(self, panel: ImagePanel, title: str, meta: str = '') -> None:
+        pix = panel.source_pixmap()
+        if pix is None:
+            self.statusBar().showMessage('No artwork preview available.')
+            return
+        dialog = ArtworkPreviewDialog(pix, title, meta or panel.meta_label.text(), self)
+        dialog.exec()
+
+    def open_current_artwork_preview(self) -> None:
+        album = self.current_album or {}
+        if not album:
+            return
+        self._open_artwork_preview(
+            self.current_panel,
+            f'Current - {self._album_display_name(album)}',
+            self.current_panel.meta_label.text(),
+        )
+
+    def open_candidate_artwork_preview(self) -> None:
+        album = self.current_album or {}
+        candidate = self._selected_candidate()
+        if not album or not candidate:
+            return
+        source = _text(candidate.get('source'), 'Candidate')
+        release = _text(candidate.get('release_title'))
+        title = f'{source} - {self._album_display_name(album)}'
+        if release:
+            title = f'{source} - {release}'
+        self._open_artwork_preview(
+            self.candidate_panel,
+            title,
+            self.candidate_panel.meta_label.text(),
+        )
+
     def _load_candidates(self, album: Dict[str, Any]) -> None:
         self.candidate_list.clear()
         self.current_candidates = []
@@ -2868,6 +2987,12 @@ class QtArtworkWindow(QMainWindow):
                     return True
                 if key == Qt.Key_S and self.skip_btn.isEnabled():
                     self.skip_current_album()
+                    return True
+                if key == Qt.Key_Space:
+                    if self._selected_candidate():
+                        self.open_candidate_artwork_preview()
+                    else:
+                        self.open_current_artwork_preview()
                     return True
                 if key == Qt.Key_N:
                     self._select_next_actionable_from_current()
@@ -4044,6 +4169,15 @@ class QtArtworkWindow(QMainWindow):
                 background: #ffffff;
                 border: 1px solid #dfe3eb;
                 border-radius: 4px;
+                color: #777b84;
+            }
+            QDialog#artworkPreviewDialog {
+                background: #f5f5f7;
+            }
+            QLabel#previewImage {
+                background: #ffffff;
+                border: 1px solid #dfe3eb;
+                border-radius: 6px;
                 color: #777b84;
             }
             QLineEdit, QTextEdit, QListWidget, QTableWidget, QComboBox, QSpinBox {
