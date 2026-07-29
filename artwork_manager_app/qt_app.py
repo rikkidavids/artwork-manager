@@ -2989,6 +2989,7 @@ class QtArtworkWindow(QMainWindow):
         self.scan_dialog: Optional[ScanDialog] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
         self.last_convert_result: Optional[Dict[str, Any]] = None
+        self.convert_batch_label = 'Convert/Save Next'
         self.last_search_log: List[str] = []
         self.last_search_album_key = ''
         self.pending_approval_row = 0
@@ -3149,7 +3150,7 @@ class QtArtworkWindow(QMainWindow):
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(['Status', 'Artist', 'Album', 'Size', 'Opts'])
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setTextElideMode(Qt.ElideRight)
@@ -3282,6 +3283,14 @@ class QtArtworkWindow(QMainWindow):
         self.convert_save_action.triggered.connect(self.convert_save_current_artwork)
         self.convert_save_next_action = QAction(_line_icon('refresh'), 'Convert/Save Next', self)
         self.convert_save_next_action.triggered.connect(self.convert_save_next_artwork)
+        self.search_selected_action = QAction(_line_icon('search'), 'Search Selected', self)
+        self.search_selected_action.triggered.connect(self.search_selected_albums)
+        self.convert_save_selected_action = QAction(_line_icon('refresh'), 'Convert/Save Selected', self)
+        self.convert_save_selected_action.triggered.connect(self.convert_save_selected_artwork)
+        self.mark_selected_good_action = QAction(_line_icon('check'), 'Mark Selected Good', self)
+        self.mark_selected_good_action.triggered.connect(self.mark_selected_albums_good)
+        self.ignore_selected_action = QAction(_line_icon('stop'), 'Ignore Selected', self)
+        self.ignore_selected_action.triggered.connect(self.ignore_selected_albums)
         self.reject_all_action = QAction(_line_icon('stop'), 'Reject All Options', self)
         self.reject_all_action.triggered.connect(self.reject_all_candidates_for_current_album)
         self.mark_good_action = QAction(_line_icon('check'), 'Mark Current Artwork Good', self)
@@ -3304,6 +3313,13 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu.addAction(self.problem_files_action)
         self.more_menu.addAction(self.open_folder_action)
         self.more_menu.addAction(self.open_source_action)
+
+        selection_menu = self.more_menu.addMenu(_line_icon('scan'), 'Selection')
+        selection_menu.addAction(self.search_selected_action)
+        selection_menu.addAction(self.convert_save_selected_action)
+        selection_menu.addSeparator()
+        selection_menu.addAction(self.mark_selected_good_action)
+        selection_menu.addAction(self.ignore_selected_action)
 
         self.more_menu.addSection('Decision')
         self.more_menu.addAction(self.mark_good_action)
@@ -3793,16 +3809,91 @@ class QtArtworkWindow(QMainWindow):
                     item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(row, col, item)
         self.table.blockSignals(False)
-        self.count_label.setText(f'{len(self.visible_albums)} shown')
+        self._update_queue_count_label()
         self._update_queue_empty_state()
 
     def _select_table_album(self) -> None:
-        rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        rows = self._selected_queue_rows()
+        self._update_queue_count_label()
         if not rows:
+            self._refresh_action_states()
             return
-        row = rows[0]
+        row = self.table.currentRow()
+        if row not in rows:
+            row = rows[0]
         if 0 <= row < len(self.visible_albums):
-            self.show_album(self.visible_albums[row])
+            album = self.visible_albums[row]
+            if _text((self.current_album or {}).get('album_key')) != _text(album.get('album_key')):
+                self.show_album(album)
+            else:
+                self._refresh_action_states()
+
+    def _selected_queue_rows(self) -> List[int]:
+        if not hasattr(self, 'table'):
+            return []
+        rows = []
+        selection_model = self.table.selectionModel()
+        if selection_model is not None:
+            rows = [idx.row() for idx in selection_model.selectedRows()]
+        if not rows:
+            rows = [idx.row() for idx in self.table.selectedIndexes()]
+        return sorted({row for row in rows if 0 <= row < len(self.visible_albums)})
+
+    def _selected_queue_albums(self) -> List[Dict[str, Any]]:
+        albums: List[Dict[str, Any]] = []
+        seen = set()
+        for row in self._selected_queue_rows():
+            album = self.visible_albums[row]
+            key = _text(album.get('album_key'))
+            if key and key in seen:
+                continue
+            albums.append(album)
+            if key:
+                seen.add(key)
+        return albums
+
+    def _selected_albums_matching(self, buckets: Optional[set[str]] = None, *, require_path: bool = False) -> List[Dict[str, Any]]:
+        albums: List[Dict[str, Any]] = []
+        for album in self._selected_queue_albums():
+            key = _text(album.get('album_key'))
+            if not key:
+                continue
+            if require_path and not _text(album.get('album_path')):
+                continue
+            if buckets is not None and self._album_bucket(album) not in buckets:
+                continue
+            albums.append(album)
+        return albums
+
+    def _album_batch_preview(self, albums: List[Dict[str, Any]], *, limit: int = 8) -> str:
+        lines = [
+            f'{index}. {self._album_display_name(album)}'
+            for index, album in enumerate(albums[:limit], 1)
+        ]
+        if len(albums) > limit:
+            lines.append(f'...plus {len(albums) - limit} more')
+        return '\n'.join(lines)
+
+    def _confirm_album_batch(self, title: str, message: str, albums: List[Dict[str, Any]]) -> bool:
+        preview = self._album_batch_preview(albums)
+        answer = QMessageBox.question(
+            self,
+            title,
+            f'{message}\n\n{preview}',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
+
+    def _update_queue_count_label(self) -> None:
+        if not hasattr(self, 'count_label'):
+            return
+        shown = len(self.visible_albums)
+        selected = len(self._selected_queue_rows()) if hasattr(self, 'table') else 0
+        if selected > 1:
+            self.count_label.setText(f'{shown:,} shown, {selected:,} selected')
+        else:
+            self.count_label.setText(f'{shown:,} shown')
 
     def _select_visible_row(self, row: int) -> bool:
         if not (0 <= row < len(self.visible_albums)):
@@ -4091,6 +4182,10 @@ class QtArtworkWindow(QMainWindow):
         busy = approval_busy or convert_busy or search_busy or source_import_busy or rescan_busy or locate_busy or deep_check_busy or repair_busy or queue_repair_busy or undo_busy
         album = self.current_album or {}
         bucket = self._album_bucket(album) if album else ''
+        selected_albums = self._selected_queue_albums() if hasattr(self, 'table') else []
+        selected_search_count = len(self._selected_albums_matching({'Missing', 'Needs Search'}, require_path=True)) if selected_albums else 0
+        selected_convert_count = len(self._selected_albums_matching({'Not Square', 'Convert'}, require_path=True)) if selected_albums else 0
+        selected_active_count = len(self._selected_albums_matching(ACTIONABLE_BUCKETS)) if selected_albums else 0
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
         batch_count = get_batch_search_count(self.settings)
         self.search_next_btn.setText(f'Search Next {batch_count}')
@@ -4098,6 +4193,14 @@ class QtArtworkWindow(QMainWindow):
         convert_batch_count = min(batch_count, len(self._convert_batch_albums()))
         self.convert_save_next_action.setText(f'Convert/Save Next {convert_batch_count or batch_count}')
         self.convert_save_next_action.setToolTip(f'Convert/save the next {batch_count} Square or Convert albums in the visible queue')
+        self.search_selected_action.setText(f'Search Selected ({selected_search_count})' if selected_search_count else 'Search Selected')
+        self.search_selected_action.setToolTip('Search selected Missing or Needs Search albums')
+        self.convert_save_selected_action.setText(f'Convert/Save Selected ({selected_convert_count})' if selected_convert_count else 'Convert/Save Selected')
+        self.convert_save_selected_action.setToolTip('Convert/save selected Square or Convert albums')
+        self.mark_selected_good_action.setText(f'Mark Selected Good ({selected_active_count})' if selected_active_count else 'Mark Selected Good')
+        self.mark_selected_good_action.setToolTip('Mark selected active albums Good')
+        self.ignore_selected_action.setText(f'Ignore Selected ({selected_active_count})' if selected_active_count else 'Ignore Selected')
+        self.ignore_selected_action.setToolTip('Ignore selected active albums')
         can_search_next = bool(self._searchable_batch_albums())
         can_convert_next = bool(self._convert_batch_albums())
         has_album_key = bool(album and _text(album.get('album_key')))
@@ -4128,6 +4231,10 @@ class QtArtworkWindow(QMainWindow):
         self.repair_queue_action.setEnabled(not busy)
         self.convert_save_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket in {'Not Square', 'Convert'} and not busy))
         self.convert_save_next_action.setEnabled(bool(can_convert_next and not busy))
+        self.search_selected_action.setEnabled(bool(selected_search_count and not busy))
+        self.convert_save_selected_action.setEnabled(bool(selected_convert_count and not busy))
+        self.mark_selected_good_action.setEnabled(bool(selected_active_count and not busy))
+        self.ignore_selected_action.setEnabled(bool(selected_active_count and not busy))
         self.reject_all_action.setEnabled(bool(has_album_key and self.current_candidates and not busy))
         self.mark_good_action.setEnabled(can_use_active_album)
         self.ignore_action.setEnabled(can_use_active_album)
@@ -4305,6 +4412,36 @@ class QtArtworkWindow(QMainWindow):
         self.search_worker = worker
         self._refresh_action_states()
         worker.start()
+
+    def search_selected_albums(self) -> None:
+        if self.search_worker is not None and self.search_worker.isRunning():
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        albums = self._selected_albums_matching({'Missing', 'Needs Search'}, require_path=True)
+        infos = [self._album_to_search_info(album) for album in albums]
+        infos = [info for info in infos if info and info.get('album_key') and info.get('album_path')]
+        if not infos:
+            self.approval_status.setText('No selected Missing or Needs Search albums can be searched.')
+            self.statusBar().showMessage('No selected Missing or Needs Search albums can be searched.')
+            self._refresh_action_states()
+            return
+        if not self._confirm_album_batch(
+            'Search selected albums?',
+            f'Search artwork providers for {len(infos)} selected album(s)?',
+            albums,
+        ):
+            self.statusBar().showMessage('Search Selected cancelled.')
+            return
+        max_per_album = get_max_candidates_per_album(self.settings)
+        self._start_search_worker(
+            infos,
+            max_per_album,
+            status_text=f'Searching {len(infos)} selected album(s)...',
+            log_lines=[f'Search Selected: {len(infos)} album(s)'],
+        )
 
     def stop_search(self) -> None:
         if self.search_worker is not None and self.search_worker.isRunning():
@@ -4613,6 +4750,44 @@ class QtArtworkWindow(QMainWindow):
         self.statusBar().showMessage(message)
         self._refresh_action_states()
 
+    def mark_selected_albums_good(self) -> None:
+        albums = self._selected_albums_matching(ACTIONABLE_BUCKETS)
+        if not albums:
+            self.approval_status.setText('No selected active albums can be marked Good.')
+            self.statusBar().showMessage('No selected active albums can be marked Good.')
+            self._refresh_action_states()
+            return
+        if not self._confirm_album_batch(
+            'Mark selected good?',
+            f'Mark {len(albums)} selected album(s) as Good and remove them from the active workflow?',
+            albums,
+        ):
+            self.statusBar().showMessage('Mark Selected Good cancelled.')
+            return
+        start_row = min(self._selected_queue_rows() or [max(0, self.table.currentRow())])
+        removed = 0
+        failed: List[str] = []
+        for album in albums:
+            album_key = _text(album.get('album_key'))
+            if not album_key:
+                continue
+            try:
+                self._mark_album_good_in_db(album_key)
+                db.mark_album_candidates(album_key, rejected=True, state_reason='album marked good by user')
+                removed += self._remove_candidate_files_for_album(album_key, include_rejected=True)
+            except Exception as exc:
+                failed.append(f'{self._album_display_name(album)}: {exc}')
+        self.reload_queue(select_first=False)
+        self._select_next_actionable_row(start_row=start_row)
+        message = f'Marked {len(albums) - len(failed)}/{len(albums)} selected album(s) Good.'
+        if removed:
+            message += f' Trashed {removed} temporary file(s).'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        if failed:
+            QMessageBox.warning(self, 'Some albums could not be marked Good', '\n'.join(failed[:8]))
+        self._refresh_action_states()
+
     def ignore_current_album(self) -> None:
         album = self.current_album or {}
         album_key = _text(album.get('album_key'))
@@ -4643,6 +4818,44 @@ class QtArtworkWindow(QMainWindow):
             message += f' Trashed {removed} temporary file(s).'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
+        self._refresh_action_states()
+
+    def ignore_selected_albums(self) -> None:
+        albums = self._selected_albums_matching(ACTIONABLE_BUCKETS)
+        if not albums:
+            self.approval_status.setText('No selected active albums can be ignored.')
+            self.statusBar().showMessage('No selected active albums can be ignored.')
+            self._refresh_action_states()
+            return
+        if not self._confirm_album_batch(
+            'Ignore selected albums?',
+            f'Ignore {len(albums)} selected album(s) and remove them from the active workflow?',
+            albums,
+        ):
+            self.statusBar().showMessage('Ignore Selected cancelled.')
+            return
+        start_row = min(self._selected_queue_rows() or [max(0, self.table.currentRow())])
+        removed = 0
+        failed: List[str] = []
+        for album in albums:
+            album_key = _text(album.get('album_key'))
+            if not album_key:
+                continue
+            try:
+                db.set_album_status(album_key, 'ignored')
+                db.mark_album_candidates(album_key, rejected=True, state_reason='album ignored by user')
+                removed += self._remove_candidate_files_for_album(album_key, include_rejected=True)
+            except Exception as exc:
+                failed.append(f'{self._album_display_name(album)}: {exc}')
+        self.reload_queue(select_first=False)
+        self._select_next_actionable_row(start_row=start_row)
+        message = f'Ignored {len(albums) - len(failed)}/{len(albums)} selected album(s).'
+        if removed:
+            message += f' Trashed {removed} temporary file(s).'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        if failed:
+            QMessageBox.warning(self, 'Some albums could not be ignored', '\n'.join(failed[:8]))
         self._refresh_action_states()
 
     def _reopened_status_for_album(self, album: Dict[str, Any]) -> str:
@@ -5340,12 +5553,51 @@ class QtArtworkWindow(QMainWindow):
             self.statusBar().showMessage('Convert/Save Next cancelled.')
             return
         self.last_convert_result = None
+        self.convert_batch_label = 'Convert/Save Next'
         backup = self._backup_before_embed()
         self.pending_approval_row = max(0, self.table.currentRow())
         self.approval_status.setText(f'Convert/Save Next starting: {len(albums)} album(s)...')
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
         self.statusBar().showMessage('Convert/Save Next running...')
+
+        worker = ConvertSaveBatchWorker(albums, backup, self.settings, self)
+        worker.progress.connect(self._convert_save_progress)
+        worker.album_completed.connect(self._convert_save_album_completed)
+        worker.completed.connect(self._convert_save_batch_completed)
+        worker.finished.connect(lambda w=worker: self._convert_save_worker_finished(w))
+        self.convert_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
+    def convert_save_selected_artwork(self) -> None:
+        if self.convert_worker is not None and self.convert_worker.isRunning():
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        albums = self._selected_albums_matching({'Not Square', 'Convert'}, require_path=True)
+        if not albums:
+            self.approval_status.setText('No selected Square or Convert albums can be fixed.')
+            self.statusBar().showMessage('No selected Square or Convert albums can be fixed.')
+            self._refresh_action_states()
+            return
+        if not self._confirm_album_batch(
+            'Convert/Save selected albums?',
+            f'Convert/save current embedded artwork for {len(albums)} selected album(s)?',
+            albums,
+        ):
+            self.statusBar().showMessage('Convert/Save Selected cancelled.')
+            return
+        self.last_convert_result = None
+        self.convert_batch_label = 'Convert/Save Selected'
+        backup = self._backup_before_embed()
+        self.pending_approval_row = min(self._selected_queue_rows() or [max(0, self.table.currentRow())])
+        self.approval_status.setText(f'Convert/Save Selected starting: {len(albums)} album(s)...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Convert/Save Selected running...')
 
         worker = ConvertSaveBatchWorker(albums, backup, self.settings, self)
         worker.progress.connect(self._convert_save_progress)
@@ -5408,7 +5660,8 @@ class QtArtworkWindow(QMainWindow):
         good = int(summary.get('good') or 0)
         needs = int(summary.get('needs_attention') or 0)
         warnings = int(summary.get('warnings') or 0)
-        message = f'Convert/Save Next complete: {good}/{total} Good'
+        label = _text(getattr(self, 'convert_batch_label', ''), 'Convert/Save Next')
+        message = f'{label} complete: {good}/{total} Good'
         if needs:
             message += f', {needs} still need attention'
         if warnings:

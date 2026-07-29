@@ -1,5 +1,7 @@
-Build 4.93 — Qt source URL import
+Build 4.94 — Qt selection batches
 
+- Added multi-select to the Qt queue, with Album Tools > Selection actions for Search Selected, Convert/Save Selected, Mark Selected Good, and Ignore Selected.
+- The queue count now quietly shows how many albums are selected when using batch actions.
 - Added Qt Import From URL for Deezer, Apple/iTunes, MusicBrainz, Discogs release links, Google redirect links, and direct image URLs.
 - Open Source Page now prefers the album/release page where available instead of only opening the raw artwork image URL.
 - Added Qt provider search-order controls in Settings, with Move Up, Move Down, and Recommended ordering.
