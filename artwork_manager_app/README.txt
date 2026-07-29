@@ -1,4 +1,4 @@
-Build 4.80 — Qt convert/save next
+Build 4.81 — Qt workflow routing
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -39,6 +39,7 @@ Build 4.80 — Qt convert/save next
 - Added Qt Choose Release in the More menu, allowing exact MusicBrainz, Deezer, iTunes, or Discogs release artwork to be imported into the normal Review queue.
 - Added Qt Convert/Save Current Artwork for Square/Convert albums, reusing the same Mac/NAS embed pipeline to rewrite current embedded art and save cover.jpg when enabled.
 - Added Qt Convert/Save Next in the More menu, processing the next visible Square/Convert albums in the same order and batch size as Search Next.
+- Search Next now focuses on Missing/Needs Search albums, leaving Square/Convert cleanup to the new Convert/Save actions.
 
 Qt review branch
 

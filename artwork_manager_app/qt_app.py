@@ -2425,7 +2425,7 @@ class QtArtworkWindow(QMainWindow):
             if not key or key in seen or not _text(album.get('album_path')):
                 continue
             bucket = self._album_bucket(album)
-            if bucket not in {'Missing', 'Needs Search', 'Not Square'}:
+            if bucket not in {'Missing', 'Needs Search'}:
                 continue
             out.append(album)
             seen.add(key)
@@ -2803,7 +2803,7 @@ class QtArtworkWindow(QMainWindow):
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
         batch_count = get_batch_search_count(self.settings)
         self.search_next_btn.setText(f'Search Next {batch_count}')
-        self.search_next_btn.setToolTip(f'Search the next {batch_count} missing, needs-search, or not-square albums in the visible queue')
+        self.search_next_btn.setToolTip(f'Search the next {batch_count} Missing or Needs Search albums in the visible queue')
         convert_batch_count = min(batch_count, len(self._convert_batch_albums()))
         self.convert_save_next_action.setText(f'Convert/Save Next {convert_batch_count or batch_count}')
         self.convert_save_next_action.setToolTip(f'Convert/save the next {batch_count} Square or Convert albums in the visible queue')
