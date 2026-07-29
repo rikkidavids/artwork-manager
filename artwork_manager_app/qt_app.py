@@ -68,7 +68,16 @@ from .config import (
     save_settings,
 )
 from .review_queue import build_candidates, google_images_url, manual_import
-from .scanner import analyze_album_folder, embedded_artwork, inspect_album_identity, scan_library, write_low_res_csv
+from .remote_worker import deep_check_album_remote, worker_enabled_for_path
+from .scanner import (
+    _deep_check_album_files,
+    analyze_album_folder,
+    deep_check_album_problem_files,
+    embedded_artwork,
+    inspect_album_identity,
+    scan_library,
+    write_low_res_csv,
+)
 from .state import evaluate_album_record, evaluate_album_state, workflow_bucket_for_status
 from .utils import open_path
 
@@ -198,6 +207,34 @@ def _candidate_quality_hint(candidate: Dict[str, Any]) -> str:
 
 def _candidate_option_meta(candidate: Dict[str, Any]) -> str:
     return f"{_candidate_dimensions(candidate)} - {int(candidate.get('score') or 0)}/100 - {_candidate_quality_hint(candidate)}"
+
+
+def _deep_count(deep: Dict[str, Any], key: str) -> int:
+    try:
+        return max(0, int(deep.get(key) or 0))
+    except Exception:
+        return 0
+
+
+def _deep_check_summary_text(deep: Dict[str, Any]) -> str:
+    deep = deep or {}
+    checked = _deep_count(deep, 'checked_files')
+    bits = []
+    for key, label in (
+        ('missing_count', 'missing'),
+        ('below_target_count', 'below target'),
+        ('non_square_count', 'not square'),
+        ('incompatible_count', 'not baseline'),
+        ('unreadable_count', 'unreadable'),
+    ):
+        count = _deep_count(deep, key)
+        if count:
+            bits.append(f'{count}/{checked or count} {label}')
+    if bits:
+        return '; '.join(bits)
+    if checked:
+        return f'{checked} file(s) OK'
+    return 'No supported music files checked'
 
 
 def _image_pixmap(source: Any) -> Optional[QPixmap]:
@@ -503,6 +540,61 @@ class AlbumRescanWorker(QThread):
                 'status': status,
                 'reason': status_reason,
                 'message': 'Album refreshed from disk.',
+            })
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AlbumDeepCheckWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, album: Dict[str, Any], settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.album = dict(album or {})
+        self.settings = dict(settings or {})
+
+    def run(self) -> None:
+        try:
+            album_path = _text(self.album.get('album_path'))
+            album_key = _text(self.album.get('album_key'))
+            if not album_path:
+                raise ValueError('The selected album has no saved folder path.')
+            target = get_preferred_artwork_size(self.settings)
+            if worker_enabled_for_path(album_path, self.settings):
+                result = deep_check_album_remote(
+                    album_path,
+                    target_size=target,
+                    settings=self.settings,
+                    problem_files=True,
+                )
+                deep = result.get('deep_file_check') if isinstance(result.get('deep_file_check'), dict) else {}
+                rows = result.get('problem_files') if isinstance(result.get('problem_files'), list) else []
+                source = 'NAS worker'
+            else:
+                if not os.path.isdir(album_path):
+                    raise ValueError('The selected album folder could not be found.')
+                try:
+                    names = sorted(os.listdir(album_path), key=lambda item: item.lower())
+                except Exception as exc:
+                    raise ValueError(f'Could not read the selected album folder: {exc}') from exc
+                music = [
+                    name for name in names
+                    if os.path.isfile(os.path.join(album_path, name)) and name.lower().endswith(MUSIC_EXTENSIONS)
+                ]
+                deep = _deep_check_album_files(album_path, music, target)
+                deep['source'] = 'mac-local'
+                rows = deep_check_album_problem_files(album_path, target_size=target, limit=500)
+                result = {'deep_file_check': deep, 'problem_files': rows}
+                source = 'Mac local'
+            self.completed.emit({
+                'album_key': album_key,
+                'album_path': album_path,
+                'target_size': target,
+                'deep_file_check': deep,
+                'problem_files': rows,
+                'source': source,
+                'raw_result': result,
             })
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -1065,6 +1157,76 @@ class CandidateOptionWidget(QFrame):
         return QSize(0, 66)
 
 
+class ProblemFilesDialog(QDialog):
+    def __init__(self, album: Dict[str, Any], result: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle('Problem Files')
+        self.resize(780, 540)
+        self.setMinimumSize(620, 420)
+
+        rows = result.get('problem_files') if isinstance(result.get('problem_files'), list) else []
+        deep = result.get('deep_file_check') if isinstance(result.get('deep_file_check'), dict) else {}
+        target = int(result.get('target_size') or deep.get('target_size') or 0)
+        source = _text(result.get('source') or deep.get('source'), 'Deep Check')
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title = QLabel('Problem Files')
+        title.setObjectName('sectionTitle')
+        layout.addWidget(title)
+
+        album_title = ElidedLabel(f"{_text(album.get('artist'), 'Unknown Artist')} - {_text(album.get('album'), 'Unknown Album')}")
+        album_title.setObjectName('mutedLabel')
+        layout.addWidget(album_title)
+
+        folder = ElidedLabel(_text(result.get('album_path') or album.get('album_path')))
+        folder.setObjectName('mutedLabel')
+        layout.addWidget(folder)
+
+        target_text = f'Target: {target}px square baseline JPEG' if target else 'Target: configured artwork rules'
+        summary = QLabel(f'{target_text} - {source} - {_deep_check_summary_text(deep)}')
+        summary.setObjectName('mutedLabel')
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        self.table = QTableWidget(len(rows), 3)
+        self.table.setHorizontalHeaderLabels(['File', 'Size', 'Issue'])
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.NoSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(31)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        for row_index, row in enumerate(rows):
+            file_item = QTableWidgetItem(_text(row.get('file'), '-'))
+            size_item = QTableWidgetItem(_text(row.get('dimensions'), '-'))
+            issues = ', '.join(_text(issue) for issue in (row.get('issues') or []) if _text(issue))
+            issue_item = QTableWidgetItem(issues or '-')
+            self.table.setItem(row_index, 0, file_item)
+            self.table.setItem(row_index, 1, size_item)
+            self.table.setItem(row_index, 2, issue_item)
+        layout.addWidget(self.table, 1)
+
+        if not rows:
+            empty = QLabel('No problem files found by the on-demand check.')
+            empty.setObjectName('emptyHint')
+            layout.addWidget(empty)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 class QtArtworkWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1081,6 +1243,7 @@ class QtArtworkWindow(QMainWindow):
         self.approval_worker: Optional[ApprovalWorker] = None
         self.search_worker: Optional[SearchWorker] = None
         self.album_rescan_worker: Optional[AlbumRescanWorker] = None
+        self.deep_check_worker: Optional[AlbumDeepCheckWorker] = None
         self.scan_dialog: Optional[ScanDialog] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
         self.last_search_log: List[str] = []
@@ -1329,6 +1492,8 @@ class QtArtworkWindow(QMainWindow):
         self.google_action.triggered.connect(self.open_google_images_for_current_album)
         self.refresh_album_action = QAction(_line_icon('refresh'), 'Refresh From Disk', self)
         self.refresh_album_action.triggered.connect(self.refresh_current_album_from_disk)
+        self.problem_files_action = QAction(_line_icon('scan'), 'Show Problem Files', self)
+        self.problem_files_action.triggered.connect(self.show_problem_files_for_current_album)
         self.mark_good_action = QAction(_line_icon('check'), 'Mark Current Artwork Good', self)
         self.mark_good_action.triggered.connect(self.mark_current_album_good)
         self.ignore_action = QAction(_line_icon('stop'), 'Ignore Album', self)
@@ -1337,6 +1502,7 @@ class QtArtworkWindow(QMainWindow):
         self.rework_action.triggered.connect(self.rework_current_album)
         self.more_menu.addAction(self.google_action)
         self.more_menu.addAction(self.refresh_album_action)
+        self.more_menu.addAction(self.problem_files_action)
         self.more_menu.addSeparator()
         self.more_menu.addAction(self.mark_good_action)
         self.more_menu.addAction(self.ignore_action)
@@ -1942,6 +2108,8 @@ class QtArtworkWindow(QMainWindow):
         status, reason = self._album_status_reason(album) if album else ('', '')
         lines = []
         if album:
+            notes = album.get('notes_json') if isinstance(album.get('notes_json'), dict) else {}
+            deep = notes.get('deep_file_check') if isinstance(notes.get('deep_file_check'), dict) else {}
             lines.extend([
                 f"Status: {workflow_bucket_for_status(status)}",
                 f"Why: {reason or _text(status, 'No status recorded')}",
@@ -1951,6 +2119,18 @@ class QtArtworkWindow(QMainWindow):
                 'Album folder:',
                 _text(album.get('album_path'), '-'),
             ])
+            if deep:
+                lines.extend([
+                    '',
+                    'Deep check:',
+                    _deep_check_summary_text(deep),
+                ])
+                first_issue = _text(deep.get('first_issue_file') or deep.get('first_non_square_file'))
+                if first_issue:
+                    lines.append(f'First issue: {first_issue}')
+                problem_files = notes.get('last_problem_files') if isinstance(notes.get('last_problem_files'), dict) else {}
+                if problem_files.get('problem_count'):
+                    lines.append(f"Problem files: {int(problem_files.get('problem_count') or 0)}")
         if candidate:
             warnings = candidate.get('warnings') or []
             if isinstance(warnings, str):
@@ -1996,7 +2176,8 @@ class QtArtworkWindow(QMainWindow):
         approval_busy = self.approval_worker is not None and self.approval_worker.isRunning()
         search_busy = self.search_worker is not None and self.search_worker.isRunning()
         rescan_busy = self.album_rescan_worker is not None and self.album_rescan_worker.isRunning()
-        busy = approval_busy or search_busy or rescan_busy
+        deep_check_busy = self.deep_check_worker is not None and self.deep_check_worker.isRunning()
+        busy = approval_busy or search_busy or rescan_busy or deep_check_busy
         album = self.current_album or {}
         bucket = self._album_bucket(album) if album else ''
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
@@ -2019,6 +2200,7 @@ class QtArtworkWindow(QMainWindow):
         self.more_btn.setEnabled(bool(has_album_key and not busy))
         self.google_action.setEnabled(bool(has_album_key and not busy))
         self.refresh_album_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
+        self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.mark_good_action.setEnabled(can_use_active_album)
         self.ignore_action.setEnabled(can_use_active_album)
         self.rework_action.setEnabled(can_rework)
@@ -2506,6 +2688,126 @@ class QtArtworkWindow(QMainWindow):
             self.album_rescan_worker = None
         self._refresh_action_states()
 
+    def show_problem_files_for_current_album(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        album_path = _text(album.get('album_path'))
+        if not album_key or not album_path:
+            return
+        if self.deep_check_worker is not None and self.deep_check_worker.isRunning():
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        label = self._album_display_name(album)
+        self.approval_status.setText(f'Checking every file: {label}...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Checking selected album for problem files...')
+        worker = AlbumDeepCheckWorker(album, self.settings, self)
+        worker.completed.connect(self._deep_check_completed)
+        worker.failed.connect(self._deep_check_failed)
+        worker.finished.connect(lambda w=worker: self._deep_check_worker_finished(w))
+        self.deep_check_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
+    def _persist_deep_check_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        album_key = _text(result.get('album_key'))
+        if not album_key:
+            return {}
+        deep = result.get('deep_file_check') if isinstance(result.get('deep_file_check'), dict) else {}
+        rows = result.get('problem_files') if isinstance(result.get('problem_files'), list) else []
+        target = result.get('target_size') or deep.get('target_size') or get_preferred_artwork_size(self.settings)
+        checked_at = deep.get('checked_at') or db.now()
+        summary = _deep_check_summary_text(deep)
+        note_updates: Dict[str, Any] = {
+            'deep_file_check': deep,
+            'last_verification': {
+                'ok': bool(_deep_count(deep, 'checked_files') > 0 and not deep.get('requires_action')),
+                'summary': summary,
+                'checked_files': deep.get('checked_files') or 0,
+                'target_size': target,
+                'checked_at': checked_at,
+                'source': result.get('source') or deep.get('source') or '',
+                'problem_count': len(rows),
+                'problem_files': rows[:50],
+            },
+        }
+        if rows:
+            note_updates['last_problem_files'] = {
+                'checked_at': checked_at,
+                'target_size': target,
+                'rows': rows[:50],
+                'problem_count': len(rows),
+                'source': result.get('source') or deep.get('source') or '',
+            }
+        try:
+            db.update_album_notes(album_key, note_updates)
+            width = deep.get('example_width') or deep.get('min_width')
+            height = deep.get('example_height') or deep.get('min_height')
+            try:
+                width = int(width) if width not in (None, '') else None
+                height = int(height) if height not in (None, '') else None
+            except Exception:
+                width = height = None
+            db.update_album_path(
+                album_key,
+                _text(result.get('album_path')),
+                example_file=deep.get('first_issue_file') or deep.get('example_file') or None,
+                width=width,
+                height=height,
+            )
+            state = db.evaluate_and_set_album_state(
+                album_key,
+                target_size=target,
+                preserve_user_terminal=False,
+                settings=self.settings,
+            )
+            db.update_album_notes(album_key, {'state_evaluation': state})
+            return state
+        except Exception:
+            return {}
+
+    def _deep_check_completed(self, result: object) -> None:
+        result = dict(result or {})
+        self.approval_progress.setVisible(False)
+        album_key = _text(result.get('album_key'))
+        state = self._persist_deep_check_result(result)
+        summary = _deep_check_summary_text(result.get('deep_file_check') if isinstance(result.get('deep_file_check'), dict) else {})
+        message = f'Problem file check complete: {summary}.'
+        self.reload_queue(select_first=False)
+        if album_key and not self._select_album_key(album_key, fallback_first=False):
+            target_filter = self._queue_filter_for_album_key(album_key)
+            if target_filter:
+                self.queue_filter = target_filter
+                self.apply_filters()
+                self._schedule_queue_filter_state_save()
+                self._select_album_key(album_key, fallback_first=True)
+        album = db.get_album(album_key) if album_key else None
+        album = album or self.current_album or {}
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        self._refresh_action_states()
+        if state:
+            result['state'] = state
+        dialog = ProblemFilesDialog(album, result, self)
+        dialog.exec()
+
+    def _deep_check_failed(self, message: str) -> None:
+        self.approval_progress.setVisible(False)
+        message = _text(message, 'Problem file check failed.')
+        self.approval_status.setText(message)
+        self.statusBar().showMessage('Problem file check failed')
+        QMessageBox.warning(self, 'Problem files failed', message)
+        self._refresh_action_states()
+
+    def _deep_check_worker_finished(self, worker: AlbumDeepCheckWorker) -> None:
+        if self.deep_check_worker is worker:
+            self.deep_check_worker = None
+        self._refresh_action_states()
+
     def open_google_images_for_current_album(self) -> None:
         album = self.current_album or {}
         album_key = _text(album.get('album_key'))
@@ -2685,6 +2987,10 @@ class QtArtworkWindow(QMainWindow):
                 return
         if self.album_rescan_worker is not None and self.album_rescan_worker.isRunning():
             QMessageBox.information(self, 'Refresh still running', 'Wait for the selected album refresh to finish before closing Artwork Manager.')
+            event.ignore()
+            return
+        if self.deep_check_worker is not None and self.deep_check_worker.isRunning():
+            QMessageBox.information(self, 'Problem file check still running', 'Wait for the selected album check to finish before closing Artwork Manager.')
             event.ignore()
             return
         if self.queue_filter_save_timer.isActive():
