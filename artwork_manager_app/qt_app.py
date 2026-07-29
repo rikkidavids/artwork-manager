@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -66,7 +67,7 @@ from .config import (
     load_settings,
     save_settings,
 )
-from .review_queue import build_candidates, manual_import
+from .review_queue import build_candidates, google_images_url, manual_import
 from .scanner import embedded_artwork, scan_library, write_low_res_csv
 from .state import evaluate_album_record, workflow_bucket_for_status
 from .utils import open_path
@@ -242,6 +243,11 @@ def _line_icon(kind: str, color: str = '#4b5563') -> QIcon:
         painter.drawLine(10, 4, 16, 4)
         painter.drawLine(16, 4, 16, 10)
         painter.drawLine(16, 4, 10, 10)
+    elif kind == 'more':
+        painter.setBrush(QBrush(QColor(color)))
+        painter.drawEllipse(QRectF(4.5, 8.5, 2.8, 2.8))
+        painter.drawEllipse(QRectF(8.6, 8.5, 2.8, 2.8))
+        painter.drawEllipse(QRectF(12.7, 8.5, 2.8, 2.8))
     painter.end()
     return QIcon(pix)
 
@@ -1132,6 +1138,27 @@ class QtArtworkWindow(QMainWindow):
         self.import_btn.setIcon(_line_icon('folder'))
         self.import_btn.setIconSize(QSize(16, 16))
         self.import_btn.clicked.connect(self.import_image_for_current_album)
+        self.more_menu = QMenu(self)
+        self.google_action = QAction(_line_icon('search'), 'Open Google Images', self)
+        self.google_action.triggered.connect(self.open_google_images_for_current_album)
+        self.mark_good_action = QAction(_line_icon('check'), 'Mark Current Artwork Good', self)
+        self.mark_good_action.triggered.connect(self.mark_current_album_good)
+        self.ignore_action = QAction(_line_icon('stop'), 'Ignore Album', self)
+        self.ignore_action.triggered.connect(self.ignore_current_album)
+        self.rework_action = QAction(_line_icon('refresh'), 'Rework Album', self)
+        self.rework_action.triggered.connect(self.rework_current_album)
+        self.more_menu.addAction(self.google_action)
+        self.more_menu.addSeparator()
+        self.more_menu.addAction(self.mark_good_action)
+        self.more_menu.addAction(self.ignore_action)
+        self.more_menu.addSeparator()
+        self.more_menu.addAction(self.rework_action)
+        self.more_btn = QPushButton('More')
+        self.more_btn.setObjectName('quietButton')
+        self.more_btn.setIcon(_line_icon('more'))
+        self.more_btn.setIconSize(QSize(16, 16))
+        self.more_btn.setMenu(self.more_menu)
+        self.more_btn.setToolTip('More album actions')
         self.open_folder_btn = QPushButton('Open Album Folder')
         self.open_folder_btn.setObjectName('quietButton')
         self.open_folder_btn.setIcon(_line_icon('folder'))
@@ -1143,6 +1170,7 @@ class QtArtworkWindow(QMainWindow):
         self.open_source_btn.setIconSize(QSize(16, 16))
         self.open_source_btn.clicked.connect(self.open_source_page)
         options.addWidget(self.import_btn)
+        options.addWidget(self.more_btn)
         options.addWidget(self.open_folder_btn)
         options.addWidget(self.open_source_btn)
         self.backup_checkbox = QCheckBox('Backup before embed')
@@ -1788,15 +1816,23 @@ class QtArtworkWindow(QMainWindow):
         self.search_next_btn.setText(f'Search Next {batch_count}')
         self.search_next_btn.setToolTip(f'Search the next {batch_count} missing, needs-search, or not-square albums in the visible queue')
         can_search_next = bool(self._searchable_batch_albums())
+        has_album_key = bool(album and _text(album.get('album_key')))
+        can_use_active_album = bool(has_album_key and bucket not in {'Good', 'Handled'} and not busy)
+        can_rework = bool(has_album_key and bucket in {'Good', 'Handled'} and not busy)
         self.find_btn.setEnabled(can_search and not busy)
         self.search_next_btn.setEnabled(can_search_next and not busy)
         self.stop_search_btn.setVisible(search_busy)
         self.stop_search_btn.setEnabled(search_busy)
         self.approve_btn.setEnabled(has_candidate and not busy)
         self.reject_btn.setEnabled(has_candidate and not busy)
-        self.skip_btn.setEnabled(bool(album and bucket not in {'Good', 'Handled'} and not busy))
+        self.skip_btn.setEnabled(can_use_active_album)
         self.backup_checkbox.setEnabled(not busy)
-        self.import_btn.setEnabled(bool(album and _text(album.get('album_key')) and bucket not in {'Good', 'Handled'} and not busy))
+        self.import_btn.setEnabled(can_use_active_album)
+        self.more_btn.setEnabled(bool(has_album_key and not busy))
+        self.google_action.setEnabled(bool(has_album_key and not busy))
+        self.mark_good_action.setEnabled(can_use_active_album)
+        self.ignore_action.setEnabled(can_use_active_album)
+        self.rework_action.setEnabled(can_rework)
         self.open_folder_btn.setEnabled(bool(self.current_album and _text(self.current_album.get('album_path'))))
         self.open_source_btn.setEnabled(bool(has_candidate and _text((self._selected_candidate() or {}).get('source_url'))))
 
@@ -2073,6 +2109,164 @@ class QtArtworkWindow(QMainWindow):
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
         self._refresh_action_states()
+
+    def _album_display_name(self, album: Dict[str, Any]) -> str:
+        artist = _text(album.get('artist'), 'Unknown Artist')
+        album_name = _text(album.get('album'), 'Unknown Album')
+        return f'{artist} - {album_name}'
+
+    def _mark_album_good_in_db(self, album_key: str, reason: str = 'marked good by user') -> None:
+        marked_at = db.now()
+        db.set_album_status(album_key, 'already_good')
+        db.update_album_notes(album_key, {
+            'artwork_compatibility': {
+                'needs_conversion': False,
+                'issue': '',
+                'accepted_as_is_at': marked_at,
+            },
+            'album_folder_cover': {
+                'needs_save': False,
+                'issue': '',
+                'accepted_as_is_at': marked_at,
+            },
+            'state_evaluation': {
+                'status': 'already_good',
+                'reason': reason,
+            },
+        })
+
+    def mark_current_album_good(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        if not album_key:
+            return
+        label = self._album_display_name(album)
+        bucket = self._album_bucket(album)
+        warning = ''
+        if bucket in {'Missing', 'Needs Search', 'Not Square', 'Convert'}:
+            warning = '\n\nThis album is still in a work queue bucket, so only mark it Good if the current embedded artwork is acceptable.'
+        answer = QMessageBox.question(
+            self,
+            'Mark current artwork good?',
+            f'Mark {label} as Good and remove it from the active workflow?{warning}',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        current_row = max(0, self.table.currentRow())
+        try:
+            self._mark_album_good_in_db(album_key)
+            db.mark_album_candidates(album_key, rejected=True, state_reason='album marked good by user')
+        except Exception as exc:
+            QMessageBox.warning(self, 'Could not mark album Good', str(exc))
+            return
+        self.reload_queue(select_first=False)
+        self._select_next_actionable_row(start_row=current_row)
+        message = f'Marked Good: {label}.'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        self._refresh_action_states()
+
+    def ignore_current_album(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        if not album_key:
+            return
+        label = self._album_display_name(album)
+        answer = QMessageBox.question(
+            self,
+            'Ignore album?',
+            f'Ignore {label} and remove it from the active workflow?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        current_row = max(0, self.table.currentRow())
+        try:
+            db.set_album_status(album_key, 'ignored')
+            db.mark_album_candidates(album_key, rejected=True, state_reason='album ignored by user')
+        except Exception as exc:
+            QMessageBox.warning(self, 'Could not ignore album', str(exc))
+            return
+        self.reload_queue(select_first=False)
+        self._select_next_actionable_row(start_row=current_row)
+        message = f'Ignored: {label}.'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        self._refresh_action_states()
+
+    def _reopened_status_for_album(self, album: Dict[str, Any]) -> str:
+        if not album:
+            return 'needs_review'
+        try:
+            status, _reason = evaluate_album_record(
+                album,
+                candidate_count=0,
+                preserve_user_terminal=False,
+                settings=self.settings,
+            )
+            if status in {'missing_artwork', 'needs_review', 'not_square_artwork', 'incompatible_artwork'}:
+                return status
+        except Exception:
+            pass
+        try:
+            if int(album.get('width') or 0) <= 0 or int(album.get('height') or 0) <= 0:
+                return 'missing_artwork'
+        except Exception:
+            return 'needs_review'
+        return 'needs_review'
+
+    def rework_current_album(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        if not album_key:
+            return
+        label = self._album_display_name(album)
+        answer = QMessageBox.question(
+            self,
+            'Rework album?',
+            f'Return {label} to Needs Work and clear saved artwork options?\n\nThis does not change the music files.',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            fresh = db.get_album(album_key) or album
+            removed_rows = db.delete_candidates_for_album(album_key)
+            new_status = self._reopened_status_for_album(fresh)
+            db.set_album_status(album_key, new_status)
+            db.update_album_notes(album_key, {
+                'reworked_at': db.now(),
+                'reworked_reason': 'Manual Rework Album action',
+            })
+        except Exception as exc:
+            QMessageBox.warning(self, 'Could not rework album', str(exc))
+            return
+        self.queue_filter = 'Needs Work'
+        self.reload_queue(select_first=False)
+        self._set_queue_filter('Needs Work')
+        self._select_album_key(album_key, fallback_first=True)
+        message = f'Reworked: {label}. Cleared {removed_rows} saved option row(s).'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        self._refresh_action_states()
+
+    def open_google_images_for_current_album(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        if not album_key:
+            return
+        try:
+            fresh = db.get_album(album_key) or {}
+        except Exception:
+            fresh = {}
+        artist = _text(fresh.get('search_artist') or fresh.get('artist') or album.get('search_artist') or album.get('artist'))
+        album_name = _text(fresh.get('search_album') or fresh.get('album') or album.get('search_album') or album.get('album'))
+        if artist or album_name:
+            webbrowser.open(google_images_url(artist, album_name))
 
     def approve_selected_candidate(self) -> None:
         candidate = self._selected_candidate()
@@ -2367,6 +2561,29 @@ class QtArtworkWindow(QMainWindow):
                 border-bottom-color: #ffffff;
                 color: #17345c;
             }
+            QMenu {
+                background: #ffffff;
+                border: 1px solid #d7dce6;
+                border-radius: 6px;
+                padding: 5px;
+            }
+            QMenu::item {
+                padding: 7px 28px 7px 24px;
+                border-radius: 4px;
+                color: #20242d;
+            }
+            QMenu::item:selected {
+                background: #e7f0ff;
+                color: #17345c;
+            }
+            QMenu::item:disabled {
+                color: #a0a4ad;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #edf0f5;
+                margin: 5px 4px;
+            }
             QGroupBox {
                 background: #ffffff;
                 border: 1px solid #e0e3ea;
@@ -2453,6 +2670,10 @@ class QtArtworkWindow(QMainWindow):
             }
             QPushButton#quietButton {
                 background: #fbfbfd;
+            }
+            QPushButton#quietButton::menu-indicator {
+                width: 0;
+                image: none;
             }
             QPushButton#filterChip {
                 background: #fbfbfd;

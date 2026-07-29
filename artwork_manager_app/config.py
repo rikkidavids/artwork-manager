@@ -4,7 +4,7 @@ import os
 import shutil
 
 APP_NAME = 'Artwork Review Manager'
-BUILD_VERSION = 'Build 4.71 — Qt manual import migration'
+BUILD_VERSION = 'Build 4.72 — Qt album actions menu'
 MIN_ARTWORK_SIZE = 1000
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
