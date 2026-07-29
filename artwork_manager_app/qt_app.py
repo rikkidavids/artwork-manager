@@ -163,6 +163,43 @@ def _path_tail(path: str, parts: int = 3) -> str:
     return path
 
 
+def _candidate_dimensions(candidate: Dict[str, Any]) -> str:
+    width, height = candidate.get('width'), candidate.get('height')
+    if width and height:
+        return f'{width} x {height}'
+    return 'Unknown size'
+
+
+def _candidate_warnings(candidate: Dict[str, Any]) -> List[str]:
+    warnings = candidate.get('warnings') or []
+    if isinstance(warnings, str):
+        warnings = [warnings]
+    return [_text(w) for w in warnings if _text(w)]
+
+
+def _candidate_quality_hint(candidate: Dict[str, Any]) -> str:
+    try:
+        score = int(candidate.get('score') or 0)
+    except Exception:
+        score = 0
+    warnings = ' '.join(w.lower() for w in _candidate_warnings(candidate))
+    if 'not square' in warnings or 'aspect' in warnings or 'stretched' in warnings:
+        return 'Check shape'
+    if 'below target' in warnings:
+        return 'Below target'
+    if 'small file' in warnings or 'small size' in warnings or 'blurry' in warnings or 'soft' in warnings:
+        return 'Check quality'
+    if score >= 85:
+        return 'Excellent'
+    if score >= 60:
+        return 'Usable'
+    return 'Weak'
+
+
+def _candidate_option_meta(candidate: Dict[str, Any]) -> str:
+    return f"{_candidate_dimensions(candidate)} - {int(candidate.get('score') or 0)}/100 - {_candidate_quality_hint(candidate)}"
+
+
 def _image_pixmap(source: Any) -> Optional[QPixmap]:
     pix = QPixmap()
     if isinstance(source, (bytes, bytearray)):
@@ -881,6 +918,57 @@ class ElidedLabel(QLabel):
         painter.end()
 
 
+class CandidateOptionWidget(QFrame):
+    def __init__(self, candidate: Dict[str, Any]):
+        super().__init__()
+        self.setObjectName('candidateOption')
+        self.setProperty('selected', False)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        thumb = QLabel('Art')
+        thumb.setObjectName('candidateThumb')
+        thumb.setAlignment(Qt.AlignCenter)
+        thumb.setFixedSize(48, 48)
+        thumb.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        pix = _image_pixmap(candidate.get('image_path'))
+        if pix and not pix.isNull():
+            thumb.setText('')
+            thumb.setPixmap(pix.scaled(44, 44, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        source = ElidedLabel(_text(candidate.get('source'), 'Artwork'))
+        source.setObjectName('candidateSource')
+        source.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        meta = ElidedLabel(_candidate_option_meta(candidate))
+        meta.setObjectName('candidateMeta')
+        meta.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        release = ElidedLabel(_text(candidate.get('release_title'), 'Saved artwork option'))
+        release.setObjectName('candidateRelease')
+        release.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+
+        text_layout = QVBoxLayout()
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(1)
+        text_layout.addWidget(source)
+        text_layout.addWidget(meta)
+        text_layout.addWidget(release)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 7, 8, 7)
+        layout.setSpacing(9)
+        layout.addWidget(thumb, 0, Qt.AlignTop)
+        layout.addLayout(text_layout, 1)
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty('selected', bool(selected))
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt naming
+        return QSize(0, 66)
+
+
 class QtArtworkWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -889,6 +977,7 @@ class QtArtworkWindow(QMainWindow):
         self.visible_albums: List[Dict[str, Any]] = []
         self.current_album: Optional[Dict[str, Any]] = None
         self.current_candidates: List[Dict[str, Any]] = []
+        self.candidate_widgets: List[CandidateOptionWidget] = []
         self.queue_filter = 'All'
         self.filter_chips: Dict[str, QPushButton] = {}
         self.current_art_worker: Optional[CurrentArtWorker] = None
@@ -1396,6 +1485,7 @@ class QtArtworkWindow(QMainWindow):
     def _clear_review_state(self) -> None:
         self.current_album = None
         self.current_candidates = []
+        self.candidate_widgets = []
         self.candidate_list.clear()
         self.album_title.setText('No album selected')
         self.album_subtitle.setText('')
@@ -1679,6 +1769,7 @@ class QtArtworkWindow(QMainWindow):
     def _load_candidates(self, album: Dict[str, Any]) -> None:
         self.candidate_list.clear()
         self.current_candidates = []
+        self.candidate_widgets = []
         key = album.get('album_key')
         if key:
             try:
@@ -1686,29 +1777,21 @@ class QtArtworkWindow(QMainWindow):
             except Exception:
                 self.current_candidates = []
         for cand in self.current_candidates:
-            label = self._candidate_label(cand)
-            item = QListWidgetItem(label)
+            widget = CandidateOptionWidget(cand)
+            item = QListWidgetItem()
             item.setData(Qt.UserRole, cand)
-            item.setSizeHint(QSize(0, 58))
+            item.setSizeHint(widget.sizeHint())
             self.candidate_list.addItem(item)
+            self.candidate_list.setItemWidget(item, widget)
+            self.candidate_widgets.append(widget)
         if self.current_candidates:
             self.candidate_list.setCurrentRow(0)
         else:
             self.candidate_panel.set_placeholder('No candidate artwork')
         self._refresh_action_states()
 
-    def _candidate_label(self, cand: Dict[str, Any]) -> str:
-        source = _text(cand.get('source'), 'Artwork')
-        dims = ''
-        if cand.get('width') and cand.get('height'):
-            dims = f" - {cand.get('width')} x {cand.get('height')}"
-        score = f" - {int(cand.get('score') or 0)}/100"
-        title = _text(cand.get('release_title'))
-        if title:
-            return f'{source}{dims}{score}\n{title}'
-        return f'{source}{dims}{score}'
-
     def _select_candidate(self, row: int) -> None:
+        self._refresh_candidate_option_selection(row)
         if row < 0 or row >= len(self.current_candidates):
             self.candidate_panel.set_placeholder('No saved candidate')
             self.open_source_btn.setEnabled(False)
@@ -1724,6 +1807,10 @@ class QtArtworkWindow(QMainWindow):
         self.open_source_btn.setEnabled(bool(_text(cand.get('source_url'))))
         self._render_details(cand)
         self._refresh_action_states()
+
+    def _refresh_candidate_option_selection(self, selected_row: int) -> None:
+        for index, widget in enumerate(self.candidate_widgets):
+            widget.set_selected(index == selected_row)
 
     def _selected_candidate(self) -> Optional[Dict[str, Any]]:
         row = self.candidate_list.currentRow()
@@ -2616,6 +2703,43 @@ class QtArtworkWindow(QMainWindow):
             }
             QListWidget::item:hover {
                 background: #f1f5fb;
+            }
+            QListWidget#candidateList {
+                padding: 4px;
+            }
+            QListWidget#candidateList::item {
+                padding: 0;
+                margin: 2px;
+                border: 0;
+            }
+            QFrame#candidateOption {
+                background: #ffffff;
+                border: 1px solid #e1e5ec;
+                border-radius: 6px;
+            }
+            QFrame#candidateOption[selected="true"] {
+                background: #e7f0ff;
+                border-color: #8aa4d6;
+            }
+            QLabel#candidateThumb {
+                background: #f8fafc;
+                border: 1px solid #e1e5ec;
+                border-radius: 4px;
+                color: #6b7280;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QLabel#candidateSource {
+                color: #111827;
+                font-weight: 700;
+            }
+            QLabel#candidateMeta {
+                color: #485465;
+                font-size: 12px;
+            }
+            QLabel#candidateRelease {
+                color: #6b7280;
+                font-size: 12px;
             }
             QTextEdit#detailsText {
                 line-height: 1.35;

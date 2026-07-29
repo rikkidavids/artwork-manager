@@ -1,4 +1,4 @@
-Build 4.72 — Qt album actions menu
+Build 4.73 — Qt candidate option cards
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -30,6 +30,7 @@ Build 4.72 — Qt album actions menu
 - Moved Open Album Folder and Open Source Page above the main decision row so the bottom actions stay usable at smaller window widths.
 - Added Qt Import Image, letting a local artwork file enter the same candidate review and approval flow as provider results.
 - Added a compact Qt More menu for Google Images, Mark Good, Ignore Album, and Rework Album so less-common workflow actions no longer clutter the main decision row.
+- Replaced the plain Qt candidate list with compact artwork option cards showing a thumbnail, source, size/score, quality hint, and truncated release title.
 
 Qt review branch
 
