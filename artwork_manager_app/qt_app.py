@@ -60,6 +60,7 @@ from .approval import (
     convert_embedded_artwork,
 )
 from . import database as db
+from .embedder import list_embed_backups, restore_embed_history
 from .config import (
     APP_DIR,
     BUILD_VERSION,
@@ -867,6 +868,21 @@ class NasWorkerCheckWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class RestoreBackupWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, history_id: Any, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.history_id = history_id
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(restore_embed_history(self.history_id))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class LibraryScanWorker(QThread):
     progress = Signal(int, int, str)
     album_queued = Signal(object)
@@ -1556,6 +1572,175 @@ class ArtworkPreviewDialog(QDialog):
         super().keyPressEvent(event)
 
 
+class BackupRestoreDialog(QDialog):
+    restore_completed = Signal(object)
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle('Backup / Restore')
+        self.resize(900, 520)
+        self.setMinimumSize(760, 420)
+        self.rows: List[Dict[str, Any]] = []
+        self.restore_worker: Optional[RestoreBackupWorker] = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+
+        title = QLabel('Backup / Restore')
+        title.setObjectName('sectionTitle')
+        layout.addWidget(title)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(['Date', 'Album / Folder', 'Files', 'Backup Folder'])
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setTextElideMode(Qt.ElideRight)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(True)
+        for col in range(self.table.columnCount()):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+        self.table.itemSelectionChanged.connect(self._refresh_button_states)
+        self.table.doubleClicked.connect(lambda _idx=None: self.restore_selected())
+        layout.addWidget(self.table, 1)
+
+        self.status_label = QLabel('')
+        self.status_label.setObjectName('mutedLabel')
+        layout.addWidget(self.status_label)
+
+        buttons = QHBoxLayout()
+        self.restore_btn = QPushButton('Restore Selected')
+        self.restore_btn.setObjectName('approveButton')
+        self.restore_btn.clicked.connect(self.restore_selected)
+        self.open_folder_btn = QPushButton('Open Backup Folder')
+        self.open_folder_btn.setObjectName('quietButton')
+        self.open_folder_btn.setIcon(_line_icon('folder'))
+        self.open_folder_btn.setIconSize(QSize(16, 16))
+        self.open_folder_btn.clicked.connect(self.open_selected_backup_folder)
+        self.refresh_btn = QPushButton('Refresh')
+        self.refresh_btn.setObjectName('quietButton')
+        self.refresh_btn.setIcon(_line_icon('refresh'))
+        self.refresh_btn.setIconSize(QSize(16, 16))
+        self.refresh_btn.clicked.connect(self.load_rows)
+        close_btn = QPushButton('Close')
+        close_btn.setObjectName('quietButton')
+        close_btn.clicked.connect(self.accept)
+        buttons.addWidget(self.restore_btn)
+        buttons.addWidget(self.open_folder_btn)
+        buttons.addWidget(self.refresh_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        self.load_rows()
+
+    def load_rows(self) -> None:
+        load_error = ''
+        try:
+            self.rows = list(list_embed_backups())
+        except Exception as exc:
+            self.rows = []
+            load_error = f'Could not load backups: {exc}'
+        self.table.setRowCount(len(self.rows))
+        for row_index, row in enumerate(self.rows):
+            values = [
+                _text(row.get('created_at')),
+                _text(row.get('album_key') or row.get('album_folder'), 'Unknown album'),
+                f"{int(row.get('backup_count') or 0)} / {int(row.get('updated') or 0)}",
+                _text(row.get('backup_dir')),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 2:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(row_index, col, item)
+        if self.rows and self.table.currentRow() < 0:
+            self.table.selectRow(0)
+        self.status_label.setText(load_error or f'{len(self.rows)} backup approval(s) found.')
+        self._refresh_button_states()
+
+    def selected_row(self) -> Optional[Dict[str, Any]]:
+        row = self.table.currentRow()
+        if 0 <= row < len(self.rows):
+            return self.rows[row]
+        return None
+
+    def _busy(self) -> bool:
+        return self.restore_worker is not None and self.restore_worker.isRunning()
+
+    def _refresh_button_states(self) -> None:
+        selected = self.selected_row()
+        busy = self._busy()
+        self.restore_btn.setEnabled(bool(selected and selected.get('history_id') and not busy))
+        self.open_folder_btn.setEnabled(bool(selected and selected.get('backup_dir') and not busy))
+        self.refresh_btn.setEnabled(not busy)
+
+    def open_selected_backup_folder(self) -> None:
+        row = self.selected_row()
+        path = _text((row or {}).get('backup_dir'))
+        if path:
+            open_path(path)
+
+    def restore_selected(self) -> None:
+        row = self.selected_row()
+        if not row:
+            QMessageBox.information(self, 'Restore backup', 'Select a backup entry first.')
+            return
+        if self._busy():
+            return
+        answer = QMessageBox.question(
+            self,
+            'Restore selected backup?',
+            'Restore backed-up music files for the selected approval? This replaces the current files with the saved backup copies.',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.status_label.setText('Restoring backed-up files...')
+        worker = RestoreBackupWorker(row.get('history_id'), self)
+        worker.completed.connect(self._restore_completed)
+        worker.failed.connect(self._restore_failed)
+        worker.finished.connect(lambda w=worker: self._restore_worker_finished(w))
+        self.restore_worker = worker
+        self._refresh_button_states()
+        worker.start()
+
+    def _restore_completed(self, result: object) -> None:
+        result = dict(result or {})
+        restored = int(result.get('restored') or 0)
+        failed = list(result.get('failed') or [])
+        message = f'Restored {restored} file(s). Failed: {len(failed)}.'
+        self.status_label.setText(message)
+        self.restore_completed.emit(result)
+        if failed:
+            QMessageBox.warning(self, 'Restore finished with warnings', message)
+        else:
+            QMessageBox.information(self, 'Restore complete', message)
+
+    def _restore_failed(self, message: str) -> None:
+        message = _text(message, 'Backup restore failed.')
+        self.status_label.setText(message)
+        QMessageBox.warning(self, 'Restore failed', message)
+        self._refresh_button_states()
+
+    def _restore_worker_finished(self, worker: RestoreBackupWorker) -> None:
+        if self.restore_worker is worker:
+            self.restore_worker = None
+        self._refresh_button_states()
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._busy():
+            QMessageBox.information(self, 'Restore still running', 'Wait for the restore to finish before closing this window.')
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 class CandidateOptionWidget(QFrame):
     def __init__(self, candidate: Dict[str, Any]):
         super().__init__()
@@ -2168,6 +2353,8 @@ class QtArtworkWindow(QMainWindow):
         self.refresh_album_action.triggered.connect(self.refresh_current_album_from_disk)
         self.problem_files_action = QAction(_line_icon('scan'), 'Show Problem Files', self)
         self.problem_files_action.triggered.connect(self.show_problem_files_for_current_album)
+        self.backup_restore_action = QAction(_line_icon('folder'), 'Backup / Restore', self)
+        self.backup_restore_action.triggered.connect(self.open_backup_restore_browser)
         self.convert_save_action = QAction(_line_icon('refresh'), 'Convert/Save Current Artwork', self)
         self.convert_save_action.triggered.connect(self.convert_save_current_artwork)
         self.convert_save_next_action = QAction(_line_icon('refresh'), 'Convert/Save Next', self)
@@ -2185,6 +2372,7 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu.addAction(self.search_more_action)
         self.more_menu.addAction(self.refresh_album_action)
         self.more_menu.addAction(self.problem_files_action)
+        self.more_menu.addAction(self.backup_restore_action)
         self.more_menu.addAction(self.convert_save_action)
         self.more_menu.addAction(self.convert_save_next_action)
         self.more_menu.addAction(self.reject_all_action)
@@ -2949,12 +3137,13 @@ class QtArtworkWindow(QMainWindow):
         self.skip_btn.setEnabled(can_use_active_album)
         self.backup_checkbox.setEnabled(not busy)
         self.import_btn.setEnabled(can_use_active_album)
-        self.more_btn.setEnabled(bool(has_album_key and not busy))
+        self.more_btn.setEnabled(not busy)
         self.google_action.setEnabled(bool(has_album_key and not busy))
         self.choose_release_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'} and not busy))
         self.search_more_action.setEnabled(bool(can_search and not busy))
         self.refresh_album_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
+        self.backup_restore_action.setEnabled(not busy)
         self.convert_save_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket in {'Not Square', 'Convert'} and not busy))
         self.convert_save_next_action.setEnabled(bool(can_convert_next and not busy))
         self.reject_all_action.setEnabled(bool(has_album_key and self.current_candidates and not busy))
@@ -3779,6 +3968,23 @@ class QtArtworkWindow(QMainWindow):
         album_name = _text(fresh.get('search_album') or fresh.get('album') or album.get('search_album') or album.get('album'))
         if artist or album_name:
             webbrowser.open(google_images_url(artist, album_name))
+
+    def open_backup_restore_browser(self) -> None:
+        dialog = BackupRestoreDialog(self)
+        dialog.restore_completed.connect(self._backup_restore_completed)
+        dialog.exec()
+
+    def _backup_restore_completed(self, result: object) -> None:
+        result = dict(result or {})
+        restored = int(result.get('restored') or 0)
+        failed = len(result.get('failed') or [])
+        current_key = _text((self.current_album or {}).get('album_key'))
+        self.reload_queue(select_first=False)
+        if current_key:
+            self._select_album_key(current_key, fallback_first=True)
+        message = f'Restore complete: {restored} file(s), {failed} failed.'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
 
     def convert_save_current_artwork(self) -> None:
         album = self.current_album or {}

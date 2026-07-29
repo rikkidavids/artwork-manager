@@ -1,4 +1,4 @@
-Build 4.84 — Qt search more
+Build 4.85 — Qt backup restore
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -43,6 +43,7 @@ Build 4.84 — Qt search more
 - Added Qt Reject All Options and app-managed temporary artwork cleanup after approve, reject, skip, mark-good, ignore, and rework actions.
 - Added click/double-click/Space artwork previews in Qt for larger current and candidate cover inspection.
 - Added Qt Search More Artwork in the More menu to keep finding additional options without discarding saved candidates.
+- Added a Qt Backup / Restore browser for restoring music-file backups created during approved embeds.
 
 Qt review branch
 
