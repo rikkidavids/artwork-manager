@@ -66,7 +66,7 @@ from .config import (
     load_settings,
     save_settings,
 )
-from .review_queue import build_candidates
+from .review_queue import build_candidates, manual_import
 from .scanner import embedded_artwork, scan_library, write_low_res_csv
 from .state import evaluate_album_record, workflow_bucket_for_status
 from .utils import open_path
@@ -1127,6 +1127,11 @@ class QtArtworkWindow(QMainWindow):
 
         options = QHBoxLayout()
         options.addStretch(1)
+        self.import_btn = QPushButton('Import Image')
+        self.import_btn.setObjectName('quietButton')
+        self.import_btn.setIcon(_line_icon('folder'))
+        self.import_btn.setIconSize(QSize(16, 16))
+        self.import_btn.clicked.connect(self.import_image_for_current_album)
         self.open_folder_btn = QPushButton('Open Album Folder')
         self.open_folder_btn.setObjectName('quietButton')
         self.open_folder_btn.setIcon(_line_icon('folder'))
@@ -1137,6 +1142,7 @@ class QtArtworkWindow(QMainWindow):
         self.open_source_btn.setIcon(_line_icon('link'))
         self.open_source_btn.setIconSize(QSize(16, 16))
         self.open_source_btn.clicked.connect(self.open_source_page)
+        options.addWidget(self.import_btn)
         options.addWidget(self.open_folder_btn)
         options.addWidget(self.open_source_btn)
         self.backup_checkbox = QCheckBox('Backup before embed')
@@ -1790,6 +1796,7 @@ class QtArtworkWindow(QMainWindow):
         self.reject_btn.setEnabled(has_candidate and not busy)
         self.skip_btn.setEnabled(bool(album and bucket not in {'Good', 'Handled'} and not busy))
         self.backup_checkbox.setEnabled(not busy)
+        self.import_btn.setEnabled(bool(album and _text(album.get('album_key')) and bucket not in {'Good', 'Handled'} and not busy))
         self.open_folder_btn.setEnabled(bool(self.current_album and _text(self.current_album.get('album_path'))))
         self.open_source_btn.setEnabled(bool(has_candidate and _text((self._selected_candidate() or {}).get('source_url'))))
 
@@ -2174,6 +2181,47 @@ class QtArtworkWindow(QMainWindow):
         path = _text(album.get('album_path'))
         if path:
             open_path(path)
+
+    def import_image_for_current_album(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        if not album_key:
+            return
+        start = _text(album.get('album_path')) or str(Path.home())
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            'Import Artwork Image',
+            start,
+            'Images (*.jpg *.jpeg *.png *.webp)',
+        )
+        path = _text(path)
+        if not path:
+            return
+        try:
+            manual_import(
+                path,
+                _text(album.get('artist'), 'Unknown Artist'),
+                _text(album.get('album'), 'Unknown Album'),
+                album_key,
+                _text(album.get('album_path')),
+            )
+            db.set_album_status(album_key, 'candidate_found')
+            db.update_album_notes(album_key, {
+                'state_evaluation': {
+                    'status': 'candidate_found',
+                    'reason': 'manual artwork option imported',
+                }
+            })
+        except Exception as exc:
+            QMessageBox.warning(self, 'Import failed', str(exc))
+            return
+        self.queue_filter = 'Review'
+        self.reload_queue(select_first=False)
+        self._set_queue_filter('Review')
+        self._select_album_key(album_key, fallback_first=True)
+        self.approval_status.setText('Imported artwork option.')
+        self.statusBar().showMessage('Imported artwork option.')
+        self._refresh_action_states()
 
     def open_source_page(self) -> None:
         row = self.candidate_list.currentRow()

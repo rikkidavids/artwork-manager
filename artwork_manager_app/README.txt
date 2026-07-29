@@ -1,4 +1,4 @@
-Build 4.70 — Qt review decisions migration
+Build 4.71 — Qt manual import migration
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -28,6 +28,7 @@ Build 4.70 — Qt review decisions migration
 - Added Qt Search Next, which batch-searches the next visible albums that need artwork and follows the first album that becomes ready for review.
 - Added Qt Reject Option and Skip Album actions, with safer queue reclassification after the last candidate is rejected.
 - Moved Open Album Folder and Open Source Page above the main decision row so the bottom actions stay usable at smaller window widths.
+- Added Qt Import Image, letting a local artwork file enter the same candidate review and approval flow as provider results.
 
 Qt review branch
 
