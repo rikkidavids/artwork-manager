@@ -1,4 +1,4 @@
-Build 4.74 — Qt album disk refresh
+Build 4.75 — Qt review keyboard flow
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -32,6 +32,7 @@ Build 4.74 — Qt album disk refresh
 - Added a compact Qt More menu for Google Images, Mark Good, Ignore Album, and Rework Album so less-common workflow actions no longer clutter the main decision row.
 - Replaced the plain Qt candidate list with compact artwork option cards showing a thumbnail, source, size/score, quality hint, and truncated release title.
 - Added Qt Refresh From Disk in the More menu, which rechecks the selected album folder in the background and follows it to the right queue bucket afterward.
+- Added Qt keyboard review flow for R Reject Option and S Skip Album, matching the existing F Find, A Approve, and N next-album shortcuts.
 
 Qt review branch
 

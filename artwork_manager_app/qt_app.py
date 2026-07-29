@@ -2044,6 +2044,12 @@ class QtArtworkWindow(QMainWindow):
                 if key == Qt.Key_A and self.approve_btn.isEnabled():
                     self.approve_selected_candidate()
                     return True
+                if key == Qt.Key_R and self.reject_btn.isEnabled():
+                    self.reject_selected_candidate()
+                    return True
+                if key == Qt.Key_S and self.skip_btn.isEnabled():
+                    self.skip_current_album()
+                    return True
                 if key == Qt.Key_N:
                     self._select_next_actionable_from_current()
                     return True
