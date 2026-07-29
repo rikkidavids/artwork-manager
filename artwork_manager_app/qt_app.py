@@ -494,6 +494,58 @@ class ConvertSaveWorker(QThread):
             self.failed.emit(f'Convert/Save failed: {exc}')
 
 
+class ConvertSaveBatchWorker(QThread):
+    progress = Signal(int, int, str)
+    album_completed = Signal(object)
+    completed = Signal(object)
+
+    def __init__(self, albums: List[Dict[str, Any]], backup: bool, settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.albums = [dict(album or {}) for album in (albums or [])]
+        self.backup = bool(backup)
+        self.settings = dict(settings or {})
+
+    def run(self) -> None:
+        results: List[Dict[str, Any]] = []
+        total = len(self.albums)
+        for index, album in enumerate(self.albums, 1):
+            label = f"{_text(album.get('artist'), 'Unknown Artist')} - {_text(album.get('album'), 'Unknown Album')}"
+            self.progress.emit(0, 0, f'Convert/Save {index}/{total}: {label}')
+            try:
+                result = convert_embedded_artwork(
+                    album,
+                    backup=self.backup,
+                    settings=self.settings,
+                    progress=lambda done, file_total, path: self.progress.emit(int(done or 0), int(file_total or 0), str(path or '')),
+                )
+                result.setdefault('artist', _text(album.get('artist')))
+                result.setdefault('album', _text(album.get('album')))
+            except Exception as exc:
+                result = {
+                    'album_key': _text(album.get('album_key')),
+                    'album_folder': _text(album.get('album_path')),
+                    'artist': _text(album.get('artist')),
+                    'album': _text(album.get('album')),
+                    'final_bucket': 'Convert',
+                    'final_reason': str(exc),
+                    'failed_items': [{'file': _text(album.get('album_path')), 'error': str(exc)}],
+                    'batch_error': str(exc),
+                }
+            results.append(result)
+            self.album_completed.emit(result)
+
+        good = sum(1 for result in results if _text(result.get('final_bucket')) == 'Good')
+        needs = sum(1 for result in results if _text(result.get('final_bucket')) in {'Convert', 'Not Square', 'Needs Search', 'Missing', 'Review'})
+        warnings = sum(1 for result in results if result.get('failed_items') or result.get('batch_error'))
+        self.completed.emit({
+            'total': total,
+            'good': good,
+            'needs_attention': needs,
+            'warnings': warnings,
+            'results': results,
+        })
+
+
 class SearchWorker(QThread):
     status_update = Signal(str)
     log_line = Signal(str)
@@ -2028,6 +2080,8 @@ class QtArtworkWindow(QMainWindow):
         self.problem_files_action.triggered.connect(self.show_problem_files_for_current_album)
         self.convert_save_action = QAction(_line_icon('refresh'), 'Convert/Save Current Artwork', self)
         self.convert_save_action.triggered.connect(self.convert_save_current_artwork)
+        self.convert_save_next_action = QAction(_line_icon('refresh'), 'Convert/Save Next', self)
+        self.convert_save_next_action.triggered.connect(self.convert_save_next_artwork)
         self.mark_good_action = QAction(_line_icon('check'), 'Mark Current Artwork Good', self)
         self.mark_good_action.triggered.connect(self.mark_current_album_good)
         self.ignore_action = QAction(_line_icon('stop'), 'Ignore Album', self)
@@ -2039,6 +2093,7 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu.addAction(self.refresh_album_action)
         self.more_menu.addAction(self.problem_files_action)
         self.more_menu.addAction(self.convert_save_action)
+        self.more_menu.addAction(self.convert_save_next_action)
         self.more_menu.addSeparator()
         self.more_menu.addAction(self.mark_good_action)
         self.more_menu.addAction(self.ignore_action)
@@ -2371,6 +2426,25 @@ class QtArtworkWindow(QMainWindow):
                 continue
             bucket = self._album_bucket(album)
             if bucket not in {'Missing', 'Needs Search', 'Not Square'}:
+                continue
+            out.append(album)
+            seen.add(key)
+        return out
+
+    def _convert_batch_albums(self) -> List[Dict[str, Any]]:
+        if not self.visible_albums:
+            return []
+        current_row = self.table.currentRow()
+        if current_row < 0 or current_row >= len(self.visible_albums):
+            current_row = 0
+        ordered = self.visible_albums[current_row:] + self.visible_albums[:current_row]
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        for album in ordered:
+            key = _text(album.get('album_key'))
+            if not key or key in seen or not _text(album.get('album_path')):
+                continue
+            if self._album_bucket(album) not in {'Not Square', 'Convert'}:
                 continue
             out.append(album)
             seen.add(key)
@@ -2730,7 +2804,11 @@ class QtArtworkWindow(QMainWindow):
         batch_count = get_batch_search_count(self.settings)
         self.search_next_btn.setText(f'Search Next {batch_count}')
         self.search_next_btn.setToolTip(f'Search the next {batch_count} missing, needs-search, or not-square albums in the visible queue')
+        convert_batch_count = min(batch_count, len(self._convert_batch_albums()))
+        self.convert_save_next_action.setText(f'Convert/Save Next {convert_batch_count or batch_count}')
+        self.convert_save_next_action.setToolTip(f'Convert/save the next {batch_count} Square or Convert albums in the visible queue')
         can_search_next = bool(self._searchable_batch_albums())
+        can_convert_next = bool(self._convert_batch_albums())
         has_album_key = bool(album and _text(album.get('album_key')))
         can_use_active_album = bool(has_album_key and bucket not in {'Good', 'Handled'} and not busy)
         can_rework = bool(has_album_key and bucket in {'Good', 'Handled'} and not busy)
@@ -2749,6 +2827,7 @@ class QtArtworkWindow(QMainWindow):
         self.refresh_album_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.convert_save_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket in {'Not Square', 'Convert'} and not busy))
+        self.convert_save_next_action.setEnabled(bool(can_convert_next and not busy))
         self.mark_good_action.setEnabled(can_use_active_album)
         self.ignore_action.setEnabled(can_use_active_album)
         self.rework_action.setEnabled(can_rework)
@@ -2773,6 +2852,9 @@ class QtArtworkWindow(QMainWindow):
                     return True
                 if key == Qt.Key_A and self.approve_btn.isEnabled():
                     self.approve_selected_candidate()
+                    return True
+                if key == Qt.Key_C and self.convert_save_action.isEnabled():
+                    self.convert_save_current_artwork()
                     return True
                 if key == Qt.Key_R and self.reject_btn.isEnabled():
                     self.reject_selected_candidate()
@@ -3428,6 +3510,54 @@ class QtArtworkWindow(QMainWindow):
         self._refresh_action_states()
         worker.start()
 
+    def convert_save_next_artwork(self) -> None:
+        if self.convert_worker is not None and self.convert_worker.isRunning():
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        batch_count = get_batch_search_count(self.settings)
+        albums = self._convert_batch_albums()[:batch_count]
+        if not albums:
+            self.approval_status.setText('No visible Square/Convert albums to fix.')
+            self.statusBar().showMessage('No visible Square/Convert albums to fix.')
+            self._refresh_action_states()
+            return
+        preview = '\n'.join(
+            f'{index}. {_text(album.get("artist"), "Unknown Artist")} - {_text(album.get("album"), "Unknown Album")}'
+            for index, album in enumerate(albums[:8], 1)
+        )
+        if len(albums) > 8:
+            preview += f'\n...plus {len(albums) - 8} more'
+        answer = QMessageBox.question(
+            self,
+            'Convert/Save next albums?',
+            f'Convert/save current embedded artwork for {len(albums)} album(s)?\n\n{preview}',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            self.statusBar().showMessage('Convert/Save Next cancelled.')
+            return
+        self.last_convert_result = None
+        backup = bool(self.backup_checkbox.isChecked())
+        self._save_backup_preference()
+        self.pending_approval_row = max(0, self.table.currentRow())
+        self.approval_status.setText(f'Convert/Save Next starting: {len(albums)} album(s)...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Convert/Save Next running...')
+
+        worker = ConvertSaveBatchWorker(albums, backup, self.settings, self)
+        worker.progress.connect(self._convert_save_progress)
+        worker.album_completed.connect(self._convert_save_album_completed)
+        worker.completed.connect(self._convert_save_batch_completed)
+        worker.finished.connect(lambda w=worker: self._convert_save_worker_finished(w))
+        self.convert_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
     def _convert_save_progress(self, done: int, total: int, path: str) -> None:
         if total > 0:
             self.approval_progress.setRange(0, total)
@@ -3461,6 +3591,45 @@ class QtArtworkWindow(QMainWindow):
             self._select_album_key(result.get('album_key'), fallback_first=True)
         if warnings or bucket in {'Convert', 'Not Square', 'Needs Search', 'Missing'}:
             QMessageBox.information(self, 'Convert/Save finished', f'{message}\n\n{reason}')
+
+    def _convert_save_album_completed(self, result: object) -> None:
+        result = dict(result or {})
+        self.last_convert_result = result
+        label = f"{_text(result.get('artist'), '')} - {_text(result.get('album'), '')}".strip(' -')
+        bucket = _text(result.get('final_bucket'), 'Done')
+        dims = _text(result.get('embedded_dimensions'), '-')
+        if label:
+            self.approval_status.setText(f'Finished {label}: {bucket} ({dims})')
+        else:
+            self.approval_status.setText(f'Finished album: {bucket} ({dims})')
+
+    def _convert_save_batch_completed(self, summary: object) -> None:
+        summary = dict(summary or {})
+        self.approval_progress.setVisible(False)
+        total = int(summary.get('total') or 0)
+        good = int(summary.get('good') or 0)
+        needs = int(summary.get('needs_attention') or 0)
+        warnings = int(summary.get('warnings') or 0)
+        message = f'Convert/Save Next complete: {good}/{total} Good'
+        if needs:
+            message += f', {needs} still need attention'
+        if warnings:
+            message += f', {warnings} warning(s)'
+        message += '.'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        results = list(summary.get('results') or [])
+        self.reload_queue(select_first=False)
+        target_key = self._first_album_key_in_buckets(
+            [result.get('album_key') for result in results],
+            {'Needs Search', 'Missing', 'Not Square', 'Convert', 'Review'},
+        )
+        if target_key:
+            self._select_album_key(target_key, fallback_first=True)
+        else:
+            self._select_next_actionable_row(start_row=self.pending_approval_row)
+        if warnings or needs:
+            QMessageBox.information(self, 'Convert/Save Next finished', message)
 
     def _convert_save_failed(self, message: str) -> None:
         self.approval_progress.setVisible(False)
