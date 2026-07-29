@@ -4,7 +4,7 @@ import os
 import shutil
 
 APP_NAME = 'Artwork Review Manager'
-BUILD_VERSION = 'Build 5.02 — Qt cleaner action row'
+BUILD_VERSION = 'Build 5.03 — Qt friendlier cover wording'
 MIN_ARTWORK_SIZE = 1000
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
@@ -102,7 +102,7 @@ DEFAULT_SETTINGS = {
     'warn_before_low_confidence_embed': True,
     # Convert approved artwork to target-size baseline JPEG before embedding/saving.
     'resize_approved_artwork': True,
-    # Verify every supported file after Approve + Embed before marking the album Good.
+    # Verify every supported file after using a cover before marking the album Good.
     'verify_after_embed_before_good': True,
     # Optional slower scan mode: inspect every supported file in each album
     # against the user's preferred target size and baseline-JPEG rules.

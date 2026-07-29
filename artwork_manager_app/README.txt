@@ -1,5 +1,6 @@
-Build 5.02 — Qt cleaner action row
+Build 5.03 — Qt friendlier cover wording
 
+- The Qt review workflow now uses simpler cover-focused labels such as Find Cover, Use This Cover, Reject Cover, and Fix Current Cover.
 - The bottom action row now hides candidate-only and inactive actions until they are useful.
 - Added a calm empty-state card to the artwork options list when an album has no saved candidate covers.
 - Simplified the Qt details panel into plain-language state, a short explanation, a few facts, and the next useful action.

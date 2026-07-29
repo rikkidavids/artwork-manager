@@ -122,7 +122,7 @@ FILTER_CHIPS = (
 )
 FILTER_TOOLTIPS = {
     'Needs Work': 'Albums that need artwork, conversion, or a fresh search.',
-    'Review': 'Albums with saved artwork options ready to check.',
+    'Review': 'Albums with saved covers ready to check.',
     'Done': 'Albums already marked good, approved, handled, or skipped.',
     'All': 'Show every album record.',
 }
@@ -594,7 +594,7 @@ class ConvertSaveWorker(QThread):
         except ApprovalBlocked as exc:
             self.failed.emit(str(exc))
         except Exception as exc:
-            self.failed.emit(f'Convert/Save failed: {exc}')
+            self.failed.emit(f'Cover fix failed: {exc}')
 
 
 class ConvertSaveBatchWorker(QThread):
@@ -613,7 +613,7 @@ class ConvertSaveBatchWorker(QThread):
         total = len(self.albums)
         for index, album in enumerate(self.albums, 1):
             label = f"{_text(album.get('artist'), 'Unknown Artist')} - {_text(album.get('album'), 'Unknown Album')}"
-            self.progress.emit(0, 0, f'Convert/Save {index}/{total}: {label}')
+            self.progress.emit(0, 0, f'Fixing cover {index}/{total}: {label}')
             try:
                 result = convert_embedded_artwork(
                     album,
@@ -794,7 +794,7 @@ class ReleaseImportWorker(QThread):
                 db.update_album_notes(album_key, {
                     'state_evaluation': {
                         'status': 'candidate_found',
-                        'reason': f'{added} selected-release artwork option(s) imported',
+                        'reason': f'{added} selected-release cover(s) imported',
                     }
                 })
             self.completed.emit({'album_key': album_key, 'added': added})
@@ -877,7 +877,7 @@ class SourceUrlImportWorker(QThread):
             db.update_album_notes(album_key, {
                 'state_evaluation': {
                     'status': 'candidate_found',
-                    'reason': f'{added} artwork option(s) imported from {source_label}',
+                    'reason': f'{added} cover(s) imported from {source_label}',
                 }
             })
         return added
@@ -1933,7 +1933,7 @@ class SettingsDialog(QDialog):
             ),
             'orphan-temp': (
                 'Clean orphan temp artwork?',
-                'Move app-managed temporary artwork that is no longer linked to saved options to the Trash?',
+                'Move app-managed temporary artwork that is no longer linked to saved covers to the Trash?',
             ),
             'approved-copies': (
                 'Trash approved copies?',
@@ -2652,7 +2652,7 @@ class CandidateOptionWidget(QFrame):
         meta = ElidedLabel(_candidate_option_meta(candidate))
         meta.setObjectName('candidateMeta')
         meta.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        release = ElidedLabel(_text(candidate.get('release_title'), 'Saved artwork option'))
+        release = ElidedLabel(_text(candidate.get('release_title'), 'Saved cover'))
         release.setObjectName('candidateRelease')
         release.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
@@ -2685,7 +2685,7 @@ class EmptyCandidateWidget(QFrame):
         self.setObjectName('candidateEmpty')
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        title_label = QLabel(_text(title, 'No artwork options'))
+        title_label = QLabel(_text(title, 'No saved covers'))
         title_label.setObjectName('candidateEmptyTitle')
         title_label.setWordWrap(True)
         hint_label = QLabel(_text(hint))
@@ -2955,7 +2955,7 @@ class ReleasePickerDialog(QDialog):
         payload = dict(payload or {})
         added = int(payload.get('added') or 0)
         if added:
-            self.status_label.setText(f'Added {added} artwork option(s) from the selected release.')
+            self.status_label.setText(f'Added {added} cover(s) from the selected release.')
             self.release_imported.emit(payload)
             self.accept()
         else:
@@ -3013,7 +3013,7 @@ class QtArtworkWindow(QMainWindow):
         self.scan_dialog: Optional[ScanDialog] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
         self.last_convert_result: Optional[Dict[str, Any]] = None
-        self.convert_batch_label = 'Convert/Save Next'
+        self.convert_batch_label = 'Fix Next Covers'
         self.last_search_log: List[str] = []
         self.last_search_album_key = ''
         self.search_batch_label = 'Search'
@@ -3269,15 +3269,15 @@ class QtArtworkWindow(QMainWindow):
         layout.addWidget(self.approval_progress)
 
         self.more_menu = QMenu(self)
-        self.import_action = QAction(_line_icon('folder'), 'Import Image...', self)
+        self.import_action = QAction(_line_icon('folder'), 'Import Cover...', self)
         self.import_action.triggered.connect(self.import_image_for_current_album)
-        self.import_url_action = QAction(_line_icon('link'), 'Import From URL...', self)
+        self.import_url_action = QAction(_line_icon('link'), 'Import Cover From URL...', self)
         self.import_url_action.triggered.connect(self.import_artwork_from_url)
         self.google_action = QAction(_line_icon('search'), 'Open Google Images', self)
         self.google_action.triggered.connect(self.open_google_images_for_current_album)
         self.choose_release_action = QAction(_line_icon('search'), 'Choose Release', self)
         self.choose_release_action.triggered.connect(self.choose_release_for_current_album)
-        self.search_more_action = QAction(_line_icon('search'), 'Search More Artwork', self)
+        self.search_more_action = QAction(_line_icon('search'), 'Find More Covers', self)
         self.search_more_action.triggered.connect(self.search_more_for_current_album)
         self.open_folder_action = QAction(_line_icon('folder'), 'Open Album Folder', self)
         self.open_folder_action.triggered.connect(self.open_album_folder)
@@ -3297,28 +3297,28 @@ class QtArtworkWindow(QMainWindow):
         self.repair_stale_action.triggered.connect(self.repair_stale_candidate_rows)
         self.repair_queue_action = QAction(_line_icon('refresh'), 'Repair Queue States', self)
         self.repair_queue_action.triggered.connect(self.repair_queue_states)
-        self.backup_before_embed_action = QAction('Backup Before Embed', self)
+        self.backup_before_embed_action = QAction('Backup Before Using Cover', self)
         self.backup_before_embed_action.setCheckable(True)
         self.backup_before_embed_action.setChecked(bool(self.settings.get('backup_before_embedding', False)))
         self.backup_before_embed_action.setToolTip('Save music-file backups before embedding')
         self.backup_before_embed_action.toggled.connect(self._save_backup_preference)
         self.undo_last_embed_action = QAction(_line_icon('refresh'), 'Undo Last Embed', self)
         self.undo_last_embed_action.triggered.connect(self.undo_last_embed)
-        self.convert_save_action = QAction(_line_icon('refresh'), 'Convert/Save Current Artwork', self)
+        self.convert_save_action = QAction(_line_icon('refresh'), 'Fix Current Cover', self)
         self.convert_save_action.triggered.connect(self.convert_save_current_artwork)
-        self.convert_save_next_action = QAction(_line_icon('refresh'), 'Convert/Save Next', self)
+        self.convert_save_next_action = QAction(_line_icon('refresh'), 'Fix Next Covers', self)
         self.convert_save_next_action.triggered.connect(self.convert_save_next_artwork)
-        self.search_selected_action = QAction(_line_icon('search'), 'Search Selected', self)
+        self.search_selected_action = QAction(_line_icon('search'), 'Find Covers For Selected', self)
         self.search_selected_action.triggered.connect(self.search_selected_albums)
-        self.convert_save_selected_action = QAction(_line_icon('refresh'), 'Convert/Save Selected', self)
+        self.convert_save_selected_action = QAction(_line_icon('refresh'), 'Fix Selected Covers', self)
         self.convert_save_selected_action.triggered.connect(self.convert_save_selected_artwork)
         self.mark_selected_good_action = QAction(_line_icon('check'), 'Mark Selected Good', self)
         self.mark_selected_good_action.triggered.connect(self.mark_selected_albums_good)
         self.ignore_selected_action = QAction(_line_icon('stop'), 'Ignore Selected', self)
         self.ignore_selected_action.triggered.connect(self.ignore_selected_albums)
-        self.reject_all_action = QAction(_line_icon('stop'), 'Reject All Options', self)
+        self.reject_all_action = QAction(_line_icon('stop'), 'Reject All Covers', self)
         self.reject_all_action.triggered.connect(self.reject_all_candidates_for_current_album)
-        self.mark_good_action = QAction(_line_icon('check'), 'Mark Current Artwork Good', self)
+        self.mark_good_action = QAction(_line_icon('check'), 'Mark Current Cover Good', self)
         self.mark_good_action.triggered.connect(self.mark_current_album_good)
         self.ignore_action = QAction(_line_icon('stop'), 'Ignore Album', self)
         self.ignore_action.triggered.connect(self.ignore_current_album)
@@ -3365,14 +3365,14 @@ class QtArtworkWindow(QMainWindow):
         self.more_btn.setMenu(self.more_menu)
 
         actions = QHBoxLayout()
-        self.find_btn = QPushButton('Find Artwork')
+        self.find_btn = QPushButton('Find Cover')
         self.find_btn.setObjectName('primaryButton')
         self.find_btn.setIcon(_line_icon('search', '#ffffff'))
         self.find_btn.setIconSize(QSize(16, 16))
         self.find_btn.clicked.connect(self.find_artwork_for_selected_album)
         actions.addWidget(self.find_btn)
 
-        self.search_next_btn = QPushButton('Search Next')
+        self.search_next_btn = QPushButton('Find Next')
         self.search_next_btn.setObjectName('quietButton')
         self.search_next_btn.setIcon(_line_icon('search'))
         self.search_next_btn.setIconSize(QSize(16, 16))
@@ -3387,22 +3387,22 @@ class QtArtworkWindow(QMainWindow):
         self.stop_search_btn.setVisible(False)
         actions.addWidget(self.stop_search_btn)
 
-        self.approve_btn = QPushButton('Approve + Embed')
+        self.approve_btn = QPushButton('Use This Cover')
         self.approve_btn.setObjectName('approveButton')
         self.approve_btn.setIcon(_line_icon('check', '#ffffff'))
         self.approve_btn.setIconSize(QSize(16, 16))
         self.approve_btn.clicked.connect(self.approve_selected_candidate)
         actions.addWidget(self.approve_btn)
 
-        self.reject_btn = QPushButton('Reject Option')
+        self.reject_btn = QPushButton('Reject Cover')
         self.reject_btn.setObjectName('quietButton')
         self.reject_btn.setIcon(_line_icon('stop'))
         self.reject_btn.setIconSize(QSize(16, 16))
-        self.reject_btn.setToolTip('Reject the selected saved artwork option')
+        self.reject_btn.setToolTip('Reject the selected saved cover')
         self.reject_btn.clicked.connect(self.reject_selected_candidate)
         actions.addWidget(self.reject_btn)
 
-        self.skip_btn = QPushButton('Skip Album')
+        self.skip_btn = QPushButton('Skip')
         self.skip_btn.setObjectName('quietButton')
         self.skip_btn.setToolTip('Mark this album as handled without embedding artwork')
         self.skip_btn.clicked.connect(self.skip_current_album)
@@ -4120,18 +4120,18 @@ class QtArtworkWindow(QMainWindow):
             self._select_candidate(0)
         else:
             self._show_empty_candidate_hint(album)
-            self.candidate_panel.set_placeholder('No candidate artwork')
+            self.candidate_panel.set_placeholder('No candidate cover')
         self._refresh_action_states()
 
     def _empty_candidate_copy(self, album: Dict[str, Any]) -> tuple[str, str]:
         bucket = self._album_bucket(album)
         if bucket in {'Missing', 'Needs Search'}:
-            return 'No artwork options yet', 'Use Find Artwork to search providers for this album.'
+            return 'No covers found yet', 'Use Find Cover to search providers for this album.'
         if bucket in {'Not Square', 'Convert'}:
-            return 'No replacement options', 'Use Convert/Save to fix the current artwork, or Find Artwork to search for a new cover.'
+            return 'No replacement covers', 'Use Fix Current Cover, or search for a new cover.'
         if bucket == 'Review':
-            return 'No saved options', 'Search again or import artwork if this album still needs a cover.'
-        return 'No artwork options', 'This album does not have any saved replacement covers.'
+            return 'No saved covers', 'Search again or import a cover if this album still needs one.'
+        return 'No saved covers', 'This album does not have any saved replacement covers.'
 
     def _show_empty_candidate_hint(self, album: Dict[str, Any]) -> None:
         title, hint = self._empty_candidate_copy(album)
@@ -4145,7 +4145,7 @@ class QtArtworkWindow(QMainWindow):
     def _select_candidate(self, row: int) -> None:
         self._refresh_candidate_option_selection(row)
         if row < 0 or row >= len(self.current_candidates):
-            self.candidate_panel.set_placeholder('No saved candidate')
+            self.candidate_panel.set_placeholder('No saved cover')
             self.open_source_action.setEnabled(False)
             self._render_details()
             return
@@ -4257,13 +4257,13 @@ class QtArtworkWindow(QMainWindow):
 
     def _details_title(self, bucket: str, candidate: Optional[Dict[str, Any]]) -> str:
         if candidate:
-            return 'Artwork option ready'
+            return 'Cover ready'
         return {
-            'Missing': 'Needs artwork',
+            'Missing': 'Needs a cover',
             'Needs Search': 'Needs a better cover',
             'Not Square': 'Needs a square cover',
             'Convert': 'Needs fixing',
-            'Review': 'Ready to review',
+            'Review': 'Ready to choose',
             'Good': 'Looks good',
             'Handled': 'Done',
         }.get(bucket, _text(bucket, 'Album selected'))
@@ -4280,13 +4280,13 @@ class QtArtworkWindow(QMainWindow):
                 return f'No embedded cover was found in {missing} of {checked} tracks.'
             return 'No embedded cover was found for this album.'
         if bucket == 'Needs Search':
-            return 'No saved artwork option is ready yet.'
+            return 'No saved cover is ready yet.'
         if bucket == 'Not Square':
             return 'The current artwork is not square.'
         if bucket == 'Convert':
             return 'The current artwork needs converting or saving.'
         if bucket == 'Review':
-            return 'There are saved artwork options waiting to be checked.'
+            return 'There are saved covers waiting to be checked.'
         if bucket in {'Good', 'Handled'}:
             return 'No action is needed for this album.'
         return _text(reason, 'Check this album when you have a moment.')
@@ -4313,13 +4313,13 @@ class QtArtworkWindow(QMainWindow):
 
     def _details_next_step(self, bucket: str, has_candidate: bool) -> str:
         if has_candidate:
-            return 'Approve it if it is the right cover, or reject it and keep looking.'
+            return 'Use this cover if it matches, or reject it and keep looking.'
         if bucket in {'Missing', 'Needs Search'}:
-            return 'Find artwork.'
+            return 'Find a cover.'
         if bucket in {'Not Square', 'Convert'}:
-            return 'Convert/save the current artwork.'
+            return 'Fix the current cover.'
         if bucket == 'Review':
-            return 'Choose an artwork option.'
+            return 'Choose a saved cover.'
         return 'Nothing needed.'
 
     def _candidate_short_size(self, candidate: Dict[str, Any]) -> str:
@@ -4400,15 +4400,15 @@ class QtArtworkWindow(QMainWindow):
         selected_active_count = len(self._selected_albums_matching(ACTIONABLE_BUCKETS)) if selected_albums else 0
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
         batch_count = get_batch_search_count(self.settings)
-        self.search_next_btn.setText(f'Search Next {batch_count}')
-        self.search_next_btn.setToolTip(f'Search the next {batch_count} Missing or Needs Search albums in the visible queue')
+        self.search_next_btn.setText(f'Find Next {batch_count}')
+        self.search_next_btn.setToolTip(f'Find covers for the next {batch_count} Missing or Needs Search albums in the visible queue')
         convert_batch_count = min(batch_count, len(self._convert_batch_albums()))
-        self.convert_save_next_action.setText(f'Convert/Save Next {convert_batch_count or batch_count}')
-        self.convert_save_next_action.setToolTip(f'Convert/save the next {batch_count} Square or Convert albums in the visible queue')
-        self.search_selected_action.setText(f'Search Selected ({selected_search_count})' if selected_search_count else 'Search Selected')
-        self.search_selected_action.setToolTip('Search selected Missing or Needs Search albums')
-        self.convert_save_selected_action.setText(f'Convert/Save Selected ({selected_convert_count})' if selected_convert_count else 'Convert/Save Selected')
-        self.convert_save_selected_action.setToolTip('Convert/save selected Square or Convert albums')
+        self.convert_save_next_action.setText(f'Fix Next {convert_batch_count or batch_count}')
+        self.convert_save_next_action.setToolTip(f'Fix covers for the next {batch_count} Square or Convert albums in the visible queue')
+        self.search_selected_action.setText(f'Find Covers For Selected ({selected_search_count})' if selected_search_count else 'Find Covers For Selected')
+        self.search_selected_action.setToolTip('Find covers for selected Missing or Needs Search albums')
+        self.convert_save_selected_action.setText(f'Fix Selected Covers ({selected_convert_count})' if selected_convert_count else 'Fix Selected Covers')
+        self.convert_save_selected_action.setToolTip('Fix selected Square or Convert albums')
         self.mark_selected_good_action.setText(f'Mark Selected Good ({selected_active_count})' if selected_active_count else 'Mark Selected Good')
         self.mark_selected_good_action.setToolTip('Mark selected active albums Good')
         self.ignore_selected_action.setText(f'Ignore Selected ({selected_active_count})' if selected_active_count else 'Ignore Selected')
@@ -4540,7 +4540,7 @@ class QtArtworkWindow(QMainWindow):
             max_per_album,
             status_text=f'Searching providers for {artist} - {album}...',
             log_lines=[f'Searching: {artist} - {album}'],
-            batch_label='Find Artwork',
+            batch_label='Find Cover',
         )
 
     def search_more_for_current_album(self) -> None:
@@ -4565,7 +4565,7 @@ class QtArtworkWindow(QMainWindow):
         self._start_search_worker(
             [info],
             target_total,
-            status_text=f'Searching for more artwork for {artist} - {album}...',
+            status_text=f'Finding more covers for {artist} - {album}...',
             log_lines=[
                 f'Search More: {artist} - {album}',
                 f'Already saved: {existing}; target after this search: {target_total}',
@@ -4617,12 +4617,12 @@ class QtArtworkWindow(QMainWindow):
         first = infos[0]
         first_label = f"{_text(first.get('artist'), 'Unknown Artist')} - {_text(first.get('album'), 'Unknown Album')}"
         self.last_search_album_key = _text(first.get('album_key'))
-        self.search_batch_label = 'Search Next'
-        self.last_search_log = [f'Search Next: {len(infos)} album(s)', f'First: {first_label}']
-        self.approval_status.setText(f'Searching next {len(infos)} album(s)...')
+        self.search_batch_label = 'Find Next'
+        self.last_search_log = [f'Find Next: {len(infos)} album(s)', f'First: {first_label}']
+        self.approval_status.setText(f'Finding covers for next {len(infos)} album(s)...')
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
-        self.statusBar().showMessage(f'Searching next {len(infos)} album(s)...')
+        self.statusBar().showMessage(f'Finding covers for next {len(infos)} album(s)...')
 
         worker = SearchWorker(infos, max_per_album, self)
         worker.status_update.connect(self._search_status)
@@ -4734,19 +4734,19 @@ class QtArtworkWindow(QMainWindow):
         result_summary = self._search_result_summary(result)
         if album_count > 1:
             if stopped:
-                message = f'{search_label} stopped after saving {saved} option(s).'
+                message = f'{search_label} stopped after saving {saved} cover(s).'
             elif saved:
-                message = f'{search_label} saved {saved} new option(s) across {album_count} album(s).'
+                message = f'{search_label} saved {saved} new cover(s) across {album_count} album(s).'
             else:
-                message = f'{search_label} finished. No new artwork options saved.'
+                message = f'{search_label} finished. No new covers saved.'
             if result_summary:
                 message += f' {result_summary}.'
         elif stopped:
-            message = f'Search stopped after saving {saved} option(s).'
+            message = f'Search stopped after saving {saved} cover(s).'
         elif saved:
-            message = f'Found {saved} new artwork option(s).'
+            message = f'Found {saved} new cover(s).'
         else:
-            message = 'No new artwork options found.'
+            message = 'No new covers found.'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
         target_key = _text(result.get('album_key'))
@@ -4813,7 +4813,7 @@ class QtArtworkWindow(QMainWindow):
         if not key:
             return {'status': '', 'reason': ''}
         try:
-            db.set_album_status(key, 'no_candidate', reason='all saved artwork options rejected')
+            db.set_album_status(key, 'no_candidate', reason='all saved covers rejected')
             return db.evaluate_and_set_album_state(
                 key,
                 candidate_count=0,
@@ -4822,10 +4822,10 @@ class QtArtworkWindow(QMainWindow):
             )
         except Exception:
             try:
-                db.set_album_status(key, 'no_candidate', reason='all saved artwork options rejected')
+                db.set_album_status(key, 'no_candidate', reason='all saved covers rejected')
             except Exception:
                 pass
-            return {'status': 'no_candidate', 'reason': 'all saved artwork options rejected'}
+            return {'status': 'no_candidate', 'reason': 'all saved covers rejected'}
 
     def reject_selected_candidate(self) -> None:
         candidate = self._selected_candidate()
@@ -4838,7 +4838,7 @@ class QtArtworkWindow(QMainWindow):
             db.mark_candidate(candidate.get('candidate_id'), rejected=True)
             removed = self._remove_candidate_files([candidate])
         except Exception as exc:
-            QMessageBox.warning(self, 'Could not reject option', str(exc))
+            QMessageBox.warning(self, 'Could not reject cover', str(exc))
             return
 
         remaining = db.load_candidates_for_album(album_key, include_rejected=False)
@@ -4848,16 +4848,16 @@ class QtArtworkWindow(QMainWindow):
             self._load_candidates(self.current_album)
             self.candidate_list.setCurrentRow(min(self.candidate_list.count() - 1, max(0, self.candidate_list.currentRow())))
             self._render_details(self._selected_candidate())
-            self.approval_status.setText(f'Rejected artwork option.{cleanup_text}')
-            self.statusBar().showMessage(f'Rejected artwork option.{cleanup_text}')
+            self.approval_status.setText(f'Rejected cover.{cleanup_text}')
+            self.statusBar().showMessage(f'Rejected cover.{cleanup_text}')
             self.reload_queue(select_first=False)
             self._select_album_key(album_key, fallback_first=True)
         else:
             self._reclassify_after_candidate_rejection(album_key)
             self.reload_queue(select_first=False)
             self._select_next_actionable_row(start_row=current_row)
-            self.approval_status.setText(f'Rejected the last option. Album moved back to search.{cleanup_text}')
-            self.statusBar().showMessage(f'Rejected the last option.{cleanup_text}')
+            self.approval_status.setText(f'Rejected the last cover. Album moved back to search.{cleanup_text}')
+            self.statusBar().showMessage(f'Rejected the last cover.{cleanup_text}')
         self._refresh_action_states()
 
     def reject_all_candidates_for_current_album(self) -> None:
@@ -4868,18 +4868,18 @@ class QtArtworkWindow(QMainWindow):
         try:
             candidates = db.load_candidates_for_album(album_key, include_rejected=False)
         except Exception as exc:
-            QMessageBox.warning(self, 'Could not load options', str(exc))
+            QMessageBox.warning(self, 'Could not load covers', str(exc))
             return
         if not candidates:
-            self.approval_status.setText('No saved artwork options to reject.')
-            self.statusBar().showMessage('No saved artwork options to reject.')
+            self.approval_status.setText('No saved covers to reject.')
+            self.statusBar().showMessage('No saved covers to reject.')
             self._refresh_action_states()
             return
         label = self._album_display_name(album)
         answer = QMessageBox.question(
             self,
-            'Reject all artwork options?',
-            f'Reject all {len(candidates)} saved artwork option(s) for {label}?',
+            'Reject all covers?',
+            f'Reject all {len(candidates)} saved cover(s) for {label}?',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -4904,7 +4904,7 @@ class QtArtworkWindow(QMainWindow):
             else:
                 self._select_next_actionable_row(start_row=current_row)
         cleanup_text = f' Trashed {removed} temporary file(s).' if removed else ''
-        message = f'Rejected all {len(candidates)} option(s) for {label}.{cleanup_text}'
+        message = f'Rejected all {len(candidates)} cover(s) for {label}.{cleanup_text}'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
         self._refresh_action_states()
@@ -4976,10 +4976,10 @@ class QtArtworkWindow(QMainWindow):
         bucket = self._album_bucket(album)
         warning = ''
         if bucket in {'Missing', 'Needs Search', 'Not Square', 'Convert'}:
-            warning = '\n\nThis album is still in a work queue bucket, so only mark it Good if the current embedded artwork is acceptable.'
+            warning = '\n\nThis album is still in a work queue bucket, so only mark it Good if the current cover is acceptable.'
         answer = QMessageBox.question(
             self,
-            'Mark current artwork good?',
+            'Mark current cover good?',
             f'Mark {label} as Good and remove it from the active workflow?{warning}',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -5141,7 +5141,7 @@ class QtArtworkWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             'Rework album?',
-            f'Return {label} to Needs Work and clear saved artwork options?\n\nThis does not change the music files.',
+            f'Return {label} to Needs Work and clear saved covers?\n\nThis does not change the music files.',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -5165,7 +5165,7 @@ class QtArtworkWindow(QMainWindow):
         self.reload_queue(select_first=False)
         self._set_queue_filter('Needs Work')
         self._select_album_key(album_key, fallback_first=True)
-        message = f'Reworked: {label}. Cleared {removed_rows} saved option row(s).'
+        message = f'Reworked: {label}. Cleared {removed_rows} saved cover row(s).'
         if removed_files:
             message += f' Trashed {removed_files} temporary file(s).'
         self.approval_status.setText(message)
@@ -5447,7 +5447,7 @@ class QtArtworkWindow(QMainWindow):
         self._set_queue_filter('Review')
         if album_key:
             self._select_album_key(album_key, fallback_first=True)
-        message = f'Added {added} artwork option(s) from the selected release.'
+        message = f'Added {added} cover(s) from the selected release.'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
         self._refresh_action_states()
@@ -5618,7 +5618,7 @@ class QtArtworkWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             'Repair missing option rows?',
-            'Remove saved artwork option records whose image files are missing?\n\nThis does not touch music files or artwork files.',
+            'Remove saved cover records whose image files are missing?\n\nThis does not touch music files or artwork files.',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
@@ -5628,7 +5628,7 @@ class QtArtworkWindow(QMainWindow):
             self.settings = load_settings()
         except Exception:
             pass
-        self.approval_status.setText('Checking saved artwork option rows...')
+        self.approval_status.setText('Checking saved cover rows...')
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
         self.statusBar().showMessage('Repairing missing option rows...')
@@ -5760,10 +5760,10 @@ class QtArtworkWindow(QMainWindow):
         self.last_convert_result = None
         label = self._album_display_name(album)
         backup = self._backup_before_embed()
-        self.approval_status.setText(f'Preparing Convert/Save: {label}...')
+        self.approval_status.setText(f'Preparing cover fix: {label}...')
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
-        self.statusBar().showMessage('Converting/saving current artwork...')
+        self.statusBar().showMessage('Fixing current cover...')
         self.pending_approval_row = max(0, self.table.currentRow())
 
         worker = ConvertSaveWorker(album, backup, self.settings, self)
@@ -5797,22 +5797,22 @@ class QtArtworkWindow(QMainWindow):
             preview += f'\n...plus {len(albums) - 8} more'
         answer = QMessageBox.question(
             self,
-            'Convert/Save next albums?',
-            f'Convert/save current embedded artwork for {len(albums)} album(s)?\n\n{preview}',
+            'Fix next covers?',
+            f'Fix the current cover for {len(albums)} album(s)?\n\n{preview}',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
-            self.statusBar().showMessage('Convert/Save Next cancelled.')
+            self.statusBar().showMessage('Fix Next cancelled.')
             return
         self.last_convert_result = None
-        self.convert_batch_label = 'Convert/Save Next'
+        self.convert_batch_label = 'Fix Next'
         backup = self._backup_before_embed()
         self.pending_approval_row = max(0, self.table.currentRow())
-        self.approval_status.setText(f'Convert/Save Next starting: {len(albums)} album(s)...')
+        self.approval_status.setText(f'Fixing covers for {len(albums)} album(s)...')
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
-        self.statusBar().showMessage('Convert/Save Next running...')
+        self.statusBar().showMessage('Fix Next running...')
 
         worker = ConvertSaveBatchWorker(albums, backup, self.settings, self)
         worker.progress.connect(self._convert_save_progress)
@@ -5837,20 +5837,20 @@ class QtArtworkWindow(QMainWindow):
             self._refresh_action_states()
             return
         if not self._confirm_album_batch(
-            'Convert/Save selected albums?',
-            f'Convert/save current embedded artwork for {len(albums)} selected album(s)?',
+            'Fix selected covers?',
+            f'Fix the current cover for {len(albums)} selected album(s)?',
             albums,
         ):
-            self.statusBar().showMessage('Convert/Save Selected cancelled.')
+            self.statusBar().showMessage('Fix Selected cancelled.')
             return
         self.last_convert_result = None
-        self.convert_batch_label = 'Convert/Save Selected'
+        self.convert_batch_label = 'Fix Selected'
         backup = self._backup_before_embed()
         self.pending_approval_row = min(self._selected_queue_rows() or [max(0, self.table.currentRow())])
-        self.approval_status.setText(f'Convert/Save Selected starting: {len(albums)} album(s)...')
+        self.approval_status.setText(f'Fixing selected covers: {len(albums)} album(s)...')
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
-        self.statusBar().showMessage('Convert/Save Selected running...')
+        self.statusBar().showMessage('Fix Selected running...')
 
         worker = ConvertSaveBatchWorker(albums, backup, self.settings, self)
         worker.progress.connect(self._convert_save_progress)
@@ -5865,22 +5865,22 @@ class QtArtworkWindow(QMainWindow):
         if total > 0:
             self.approval_progress.setRange(0, total)
             self.approval_progress.setValue(max(0, min(done, total)))
-            self.approval_status.setText(f'Convert/Save {done}/{total}: {_path_tail(path, parts=2)}')
-            self.statusBar().showMessage(f'Convert/Save {done}/{total}')
+            self.approval_status.setText(f'Fixing cover {done}/{total}: {_path_tail(path, parts=2)}')
+            self.statusBar().showMessage(f'Fixing cover {done}/{total}')
         else:
             self.approval_progress.setRange(0, 0)
-            self.approval_status.setText(_text(path, 'Preparing Convert/Save...'))
+            self.approval_status.setText(_text(path, 'Preparing cover fix...'))
 
     def _convert_save_completed(self, result: object) -> None:
         result = dict(result or {})
         self.last_convert_result = result
         self.approval_progress.setVisible(False)
         bucket = _text(result.get('final_bucket'), 'Done')
-        reason = _text(result.get('final_reason'), 'Convert/Save complete.')
+        reason = _text(result.get('final_reason'), 'Cover fix complete.')
         dims = _text(result.get('embedded_dimensions'), '-')
         warnings = len(result.get('failed_items') or [])
         cover = _text(result.get('album_artwork_copy'))
-        message = f'Convert/Save complete: {bucket} ({dims}).'
+        message = f'Cover fix complete: {bucket} ({dims}).'
         if cover:
             message += ' cover.jpg saved.'
         if warnings:
@@ -5893,7 +5893,7 @@ class QtArtworkWindow(QMainWindow):
         else:
             self._select_album_key(result.get('album_key'), fallback_first=True)
         if warnings or bucket in {'Convert', 'Not Square', 'Needs Search', 'Missing'}:
-            QMessageBox.information(self, 'Convert/Save finished', f'{message}\n\n{reason}')
+            QMessageBox.information(self, 'Cover fix finished', f'{message}\n\n{reason}')
 
     def _convert_save_album_completed(self, result: object) -> None:
         result = dict(result or {})
@@ -5913,7 +5913,7 @@ class QtArtworkWindow(QMainWindow):
         good = int(summary.get('good') or 0)
         needs = int(summary.get('needs_attention') or 0)
         warnings = int(summary.get('warnings') or 0)
-        label = _text(getattr(self, 'convert_batch_label', ''), 'Convert/Save Next')
+        label = _text(getattr(self, 'convert_batch_label', ''), 'Fix Next')
         message = f'{label} complete: {good}/{total} Good'
         if needs:
             message += f', {needs} still need attention'
@@ -5933,14 +5933,14 @@ class QtArtworkWindow(QMainWindow):
         else:
             self._select_next_actionable_row(start_row=self.pending_approval_row)
         if warnings or needs:
-            QMessageBox.information(self, 'Convert/Save Next finished', message)
+            QMessageBox.information(self, 'Cover fix finished', message)
 
     def _convert_save_failed(self, message: str) -> None:
         self.approval_progress.setVisible(False)
-        message = _text(message, 'Convert/Save failed.')
+        message = _text(message, 'Cover fix failed.')
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
-        QMessageBox.warning(self, 'Cannot Convert/Save artwork', message)
+        QMessageBox.warning(self, 'Cannot fix cover', message)
         self._refresh_action_states()
 
     def _convert_save_worker_finished(self, worker: ConvertSaveWorker) -> None:
@@ -5970,10 +5970,10 @@ class QtArtworkWindow(QMainWindow):
 
         self.last_approval_result = None
         backup = self._backup_before_embed()
-        self.approval_status.setText('Preparing embed...')
+        self.approval_status.setText('Preparing cover...')
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
-        self.statusBar().showMessage('Embedding artwork...')
+        self.statusBar().showMessage('Using cover...')
         self.pending_approval_row = max(0, self.table.currentRow())
 
         worker = ApprovalWorker(candidate, backup, self)
@@ -5989,11 +5989,11 @@ class QtArtworkWindow(QMainWindow):
         if total > 0:
             self.approval_progress.setRange(0, total)
             self.approval_progress.setValue(max(0, min(done, total)))
-            self.approval_status.setText(f'Embedding {done}/{total}: {_path_tail(path, parts=2)}')
-            self.statusBar().showMessage(f'Embedding {done}/{total}')
+            self.approval_status.setText(f'Using cover {done}/{total}: {_path_tail(path, parts=2)}')
+            self.statusBar().showMessage(f'Using cover {done}/{total}')
         else:
             self.approval_progress.setRange(0, 0)
-            self.approval_status.setText(_text(path, 'Embedding artwork...'))
+            self.approval_status.setText(_text(path, 'Using cover...'))
 
     def _approval_completed(self, result: object) -> None:
         result = dict(result or {})
@@ -6004,16 +6004,16 @@ class QtArtworkWindow(QMainWindow):
         total = int(result.get('total_files') or result.get('total') or 0)
         if complete:
             removed = self._remove_candidate_files_for_album(result.get('album_key'), include_rejected=True)
-            message = f'Approved and embedded artwork into {updated}/{total} file(s).'
+            message = f'Used cover in {updated}/{total} file(s).'
             if removed:
                 message += f' Trashed {removed} temporary file(s).'
             self.approval_status.setText(message)
             self.statusBar().showMessage(message)
         else:
-            message = result.get('final_reason') or 'Approval incomplete; candidate kept for retry.'
+            message = result.get('final_reason') or 'Cover was not fully applied; saved cover kept for retry.'
             self.approval_status.setText(message)
             self.statusBar().showMessage(message)
-            QMessageBox.warning(self, 'Approval incomplete', f'{message}\n\nUpdated {updated}/{total} file(s).')
+            QMessageBox.warning(self, 'Cover not fully applied', f'{message}\n\nUpdated {updated}/{total} file(s).')
         self.reload_queue(select_first=False)
         if complete:
             self._select_next_actionable_row(start_row=self.pending_approval_row)
@@ -6024,7 +6024,7 @@ class QtArtworkWindow(QMainWindow):
         self.approval_progress.setVisible(False)
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
-        QMessageBox.warning(self, 'Cannot approve artwork', message)
+        QMessageBox.warning(self, 'Cannot use cover', message)
         self._refresh_action_states()
 
     def _approval_worker_finished(self, worker: ApprovalWorker) -> None:
@@ -6070,7 +6070,7 @@ class QtArtworkWindow(QMainWindow):
         start = _text(album.get('album_path')) or str(Path.home())
         path, _selected_filter = QFileDialog.getOpenFileName(
             self,
-            'Import Artwork Image',
+            'Import Cover Image',
             start,
             'Images (*.jpg *.jpeg *.png *.webp)',
         )
@@ -6089,7 +6089,7 @@ class QtArtworkWindow(QMainWindow):
             db.update_album_notes(album_key, {
                 'state_evaluation': {
                     'status': 'candidate_found',
-                    'reason': 'manual artwork option imported',
+                'reason': 'manual cover imported',
                 }
             })
         except Exception as exc:
@@ -6099,8 +6099,8 @@ class QtArtworkWindow(QMainWindow):
         self.reload_queue(select_first=False)
         self._set_queue_filter('Review')
         self._select_album_key(album_key, fallback_first=True)
-        self.approval_status.setText('Imported artwork option.')
-        self.statusBar().showMessage('Imported artwork option.')
+        self.approval_status.setText('Imported cover.')
+        self.statusBar().showMessage('Imported cover.')
         self._refresh_action_states()
 
     def import_artwork_from_url(self) -> None:
@@ -6120,7 +6120,7 @@ class QtArtworkWindow(QMainWindow):
             return
         value, ok = QInputDialog.getText(
             self,
-            'Import Artwork From URL',
+            'Import Cover From URL',
             'Paste a Deezer, Apple/iTunes, MusicBrainz, Discogs release link, or a direct image URL:',
         )
         if not ok or not _text(value):
@@ -6129,10 +6129,10 @@ class QtArtworkWindow(QMainWindow):
             self.settings = load_settings()
         except Exception:
             pass
-        self.approval_status.setText('Importing artwork from URL...')
+        self.approval_status.setText('Importing cover from URL...')
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
-        self.statusBar().showMessage('Importing artwork from URL...')
+        self.statusBar().showMessage('Importing cover from URL...')
         worker = SourceUrlImportWorker(info, _text(value), self.settings, self)
         worker.completed.connect(self._source_url_import_completed)
         worker.failed.connect(self._source_url_import_failed)
@@ -6155,7 +6155,7 @@ class QtArtworkWindow(QMainWindow):
                 self._select_album_key(album_key, fallback_first=True)
         elif album_key:
             self._select_album_key(album_key, fallback_first=True)
-        message = f'Added {added} artwork option(s) from {source}.' if added else f'{source} was recognised, but no suitable artwork met your size rules.'
+        message = f'Added {added} cover(s) from {source}.' if added else f'{source} was recognised, but no suitable cover met your size rules.'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
         self._refresh_action_states()
@@ -6214,7 +6214,7 @@ class QtArtworkWindow(QMainWindow):
             event.ignore()
             return
         if self.convert_worker is not None and self.convert_worker.isRunning():
-            QMessageBox.information(self, 'Convert/Save still running', 'Wait for the selected album Convert/Save to finish before closing Artwork Manager.')
+            QMessageBox.information(self, 'Cover fix still running', 'Wait for the selected cover fix to finish before closing Artwork Manager.')
             event.ignore()
             return
         if self.queue_filter_save_timer.isActive():
