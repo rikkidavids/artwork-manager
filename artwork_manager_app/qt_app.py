@@ -2162,6 +2162,8 @@ class QtArtworkWindow(QMainWindow):
         self.google_action.triggered.connect(self.open_google_images_for_current_album)
         self.choose_release_action = QAction(_line_icon('search'), 'Choose Release', self)
         self.choose_release_action.triggered.connect(self.choose_release_for_current_album)
+        self.search_more_action = QAction(_line_icon('search'), 'Search More Artwork', self)
+        self.search_more_action.triggered.connect(self.search_more_for_current_album)
         self.refresh_album_action = QAction(_line_icon('refresh'), 'Refresh From Disk', self)
         self.refresh_album_action.triggered.connect(self.refresh_current_album_from_disk)
         self.problem_files_action = QAction(_line_icon('scan'), 'Show Problem Files', self)
@@ -2180,6 +2182,7 @@ class QtArtworkWindow(QMainWindow):
         self.rework_action.triggered.connect(self.rework_current_album)
         self.more_menu.addAction(self.google_action)
         self.more_menu.addAction(self.choose_release_action)
+        self.more_menu.addAction(self.search_more_action)
         self.more_menu.addAction(self.refresh_album_action)
         self.more_menu.addAction(self.problem_files_action)
         self.more_menu.addAction(self.convert_save_action)
@@ -2949,6 +2952,7 @@ class QtArtworkWindow(QMainWindow):
         self.more_btn.setEnabled(bool(has_album_key and not busy))
         self.google_action.setEnabled(bool(has_album_key and not busy))
         self.choose_release_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'} and not busy))
+        self.search_more_action.setEnabled(bool(can_search and not busy))
         self.refresh_album_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.convert_save_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket in {'Not Square', 'Convert'} and not busy))
@@ -3031,14 +3035,55 @@ class QtArtworkWindow(QMainWindow):
         max_per_album = get_max_candidates_per_album(self.settings)
         artist = _text(info.get('search_artist') or info.get('artist'), 'Unknown Artist')
         album = _text(info.get('search_album') or info.get('album'), 'Unknown Album')
-        self.last_search_album_key = _text(info.get('album_key'))
-        self.last_search_log = [f'Searching: {artist} - {album}']
-        self.approval_status.setText(f'Searching providers for {artist} - {album}...')
+        self._start_search_worker(
+            [info],
+            max_per_album,
+            status_text=f'Searching providers for {artist} - {album}...',
+            log_lines=[f'Searching: {artist} - {album}'],
+        )
+
+    def search_more_for_current_album(self) -> None:
+        info = self._album_to_search_info(self.current_album)
+        if not info or not info.get('album_key') or not info.get('album_path'):
+            QMessageBox.warning(self, 'Cannot search more artwork', 'Select an album with a known folder first.')
+            return
+        if self.search_worker is not None and self.search_worker.isRunning():
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        try:
+            existing = len(db.load_candidates_for_album(info['album_key'], include_rejected=False))
+        except Exception:
+            existing = len(self.current_candidates or [])
+        extra = get_max_candidates_per_album(self.settings)
+        target_total = existing + extra
+        artist = _text(info.get('search_artist') or info.get('artist'), 'Unknown Artist')
+        album = _text(info.get('search_album') or info.get('album'), 'Unknown Album')
+        self._start_search_worker(
+            [info],
+            target_total,
+            status_text=f'Searching for more artwork for {artist} - {album}...',
+            log_lines=[
+                f'Search More: {artist} - {album}',
+                f'Already saved: {existing}; target after this search: {target_total}',
+            ],
+        )
+
+    def _start_search_worker(self, infos: List[Dict[str, Any]], max_per_album: int, *, status_text: str, log_lines: List[str]) -> None:
+        if self.search_worker is not None and self.search_worker.isRunning():
+            return
+        infos = [dict(info or {}) for info in (infos or []) if info and info.get('album_key') and info.get('album_path')]
+        if not infos:
+            return
+        self.last_search_album_key = _text(infos[0].get('album_key'))
+        self.last_search_log = list(log_lines or [])
+        self.approval_status.setText(status_text)
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
-        self.statusBar().showMessage('Finding artwork...')
-
-        worker = SearchWorker([info], max_per_album, self)
+        self.statusBar().showMessage(status_text)
+        worker = SearchWorker(infos, max_per_album, self)
         worker.status_update.connect(self._search_status)
         worker.log_line.connect(self._search_log)
         worker.candidate_found.connect(self._search_candidate_found)
