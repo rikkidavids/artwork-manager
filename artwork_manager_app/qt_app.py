@@ -112,12 +112,12 @@ MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 WORK_BUCKETS = {'Missing', 'Needs Search', 'Not Square', 'Convert'}
 ACTIONABLE_BUCKETS = WORK_BUCKETS | {'Review'}
 DONE_BUCKETS = {'Good', 'Handled'}
-QUEUE_FILTERS = ('Needs Work', 'Review', 'Done', 'All')
+QUEUE_FILTERS = ('All', 'Needs Work', 'Review', 'Done')
 FILTER_CHIPS = (
+    ('All', 'All'),
     ('Needs Work', 'Needs Work'),
     ('Review', 'Review'),
     ('Done', 'Done'),
-    ('All', 'All'),
 )
 FILTER_TOOLTIPS = {
     'Needs Work': 'Albums that need artwork, conversion, or a fresh search.',
@@ -3727,6 +3727,9 @@ class QtArtworkWindow(QMainWindow):
             for name in QUEUE_COLUMNS
         }
         excess = sum(fitted.values()) - available
+        if excess < 0:
+            fitted['album'] += abs(excess)
+            return fitted
         if excess <= 0:
             return fitted
         for name in ('album', 'artist', 'current', 'status', 'candidates'):
@@ -3751,7 +3754,44 @@ class QtArtworkWindow(QMainWindow):
     def _queue_column_resized(self, _logical_index: int, _old_size: int, _new_size: int) -> None:
         if self._restoring_queue_columns:
             return
+        self._rebalance_queue_columns_after_resize(_logical_index)
         self.queue_column_save_timer.start(350)
+
+    def _rebalance_queue_columns_after_resize(self, resized_col: int) -> None:
+        available = max(0, int(self.table.viewport().width()) - 2)
+        if available <= 80:
+            return
+        widths = {
+            name: max(QUEUE_COLUMN_MIN_WIDTHS.get(name, 40), int(self.table.columnWidth(col)))
+            for col, name in enumerate(QUEUE_COLUMNS)
+        }
+        delta = available - sum(widths.values())
+        if delta == 0:
+            return
+        resized_name = QUEUE_COLUMNS[resized_col] if 0 <= resized_col < len(QUEUE_COLUMNS) else ''
+        if delta > 0:
+            fill_name = 'album' if resized_name != 'album' else 'artist'
+            widths[fill_name] = widths.get(fill_name, 0) + delta
+        else:
+            excess = abs(delta)
+            for name in ('album', 'artist', 'current', 'status', 'candidates'):
+                if name == resized_name:
+                    continue
+                minimum = QUEUE_COLUMN_MIN_WIDTHS.get(name, 40)
+                reducible = max(0, widths.get(name, minimum) - minimum)
+                take = min(excess, reducible)
+                widths[name] -= take
+                excess -= take
+                if excess <= 0:
+                    break
+            if excess > 0:
+                return
+        self._restoring_queue_columns = True
+        try:
+            for col, name in enumerate(QUEUE_COLUMNS):
+                self.table.setColumnWidth(col, widths.get(name, DEFAULT_QUEUE_COLUMN_WIDTHS.get(name, 100)))
+        finally:
+            self._restoring_queue_columns = False
 
     def _save_queue_column_widths(self) -> None:
         try:

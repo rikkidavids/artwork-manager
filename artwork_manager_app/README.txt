@@ -1,5 +1,7 @@
-Build 4.96 — Qt review handoff
+Build 4.97 — Qt queue column polish
 
+- Reordered queue chips to All, Needs Work, Review, Done.
+- The queue table now fills the available width so the right edge of Opts stays pinned to the table edge after column resizing.
 - When the last item in Review is handled, the Qt app now moves to Needs Work automatically if more work is waiting.
 - Fixed long album/file-path text in the right-hand artwork panels so it truncates instead of squeezing the queue panel.
 - Added multi-select to the Qt queue, with Album Tools > Selection actions for Search Selected, Convert/Save Selected, Mark Selected Good, and Ignore Selected.
