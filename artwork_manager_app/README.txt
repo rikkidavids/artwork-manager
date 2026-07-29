@@ -1,6 +1,7 @@
-Build 4.89 — Qt queue state repair
+Build 4.90 — Qt diagnostics export
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
+- Added Qt Export Diagnostics so support reports can be saved from the modern app with sensitive tokens hidden.
 - Added Qt Repair Queue States to fix stale saved queue labels using existing database metadata without scanning NAS album folders.
 - Added a Qt Settings Storage tab for app-managed cleanup: handled temp artwork, orphan temp artwork, approved copy cache, and app data folder access.
 - Added Qt Locate Album Folder so moved or remounted NAS album paths can be repaired without opening the old app.

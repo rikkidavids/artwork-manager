@@ -5,10 +5,12 @@ helpers while the migration from the established Tk window continues.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -67,6 +69,7 @@ from .config import (
     BUILD_VERSION,
     DATA_DIR,
     IMPORT_DIR,
+    REPORT_DIR,
     TEMP_DIR,
     get_batch_search_count,
     get_deep_scan_all_files,
@@ -2918,6 +2921,8 @@ class QtArtworkWindow(QMainWindow):
         self.problem_files_action.triggered.connect(self.show_problem_files_for_current_album)
         self.backup_restore_action = QAction(_line_icon('folder'), 'Backup / Restore', self)
         self.backup_restore_action.triggered.connect(self.open_backup_restore_browser)
+        self.export_diagnostics_action = QAction(_line_icon('scan'), 'Export Diagnostics...', self)
+        self.export_diagnostics_action.triggered.connect(self.export_diagnostics)
         self.repair_stale_action = QAction(_line_icon('scan'), 'Repair Missing Option Rows', self)
         self.repair_stale_action.triggered.connect(self.repair_stale_candidate_rows)
         self.repair_queue_action = QAction(_line_icon('refresh'), 'Repair Queue States', self)
@@ -2941,6 +2946,7 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu.addAction(self.locate_folder_action)
         self.more_menu.addAction(self.problem_files_action)
         self.more_menu.addAction(self.backup_restore_action)
+        self.more_menu.addAction(self.export_diagnostics_action)
         self.more_menu.addAction(self.repair_stale_action)
         self.more_menu.addAction(self.repair_queue_action)
         self.more_menu.addAction(self.convert_save_action)
@@ -3718,6 +3724,7 @@ class QtArtworkWindow(QMainWindow):
         self.locate_folder_action.setEnabled(bool(has_album_key and not busy))
         self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.backup_restore_action.setEnabled(not busy)
+        self.export_diagnostics_action.setEnabled(not busy)
         self.repair_stale_action.setEnabled(not busy)
         self.repair_queue_action.setEnabled(not busy)
         self.convert_save_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket in {'Not Square', 'Convert'} and not busy))
@@ -4606,6 +4613,82 @@ class QtArtworkWindow(QMainWindow):
         message = f'Restore complete: {restored} file(s), {failed} failed.'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
+
+    def _redacted_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
+        redacted = {}
+        for key, value in dict(settings or {}).items():
+            lowered = str(key).lower()
+            if value and any(part in lowered for part in ('token', 'password', 'secret', 'api_key')):
+                redacted[key] = 'set (hidden)'
+            else:
+                redacted[key] = value
+        return redacted
+
+    def diagnostics_text(self) -> str:
+        album_key = _text((self.current_album or {}).get('album_key'))
+        try:
+            album = db.get_album(album_key) if album_key else None
+        except Exception as exc:
+            album = {'album_key': album_key, 'error': str(exc)}
+        try:
+            counts = db.album_counts()
+        except Exception as exc:
+            counts = {'error': str(exc)}
+        try:
+            settings = self._redacted_settings(load_settings())
+        except Exception as exc:
+            settings = {'error': str(exc)}
+        recent_lines = []
+        if self.last_search_log:
+            recent_lines.extend(['Recent search log:', *self.last_search_log[-30:], ''])
+        if self.last_approval_result:
+            recent_lines.extend(['Last approval result:', json.dumps(self.last_approval_result, indent=2, default=str), ''])
+        if self.last_convert_result:
+            recent_lines.extend(['Last convert/save result:', json.dumps(self.last_convert_result, indent=2, default=str), ''])
+        payload = [
+            'Artwork Review Manager diagnostics',
+            f'Build: {BUILD_VERSION}',
+            f'Generated: {time.strftime("%Y-%m-%d %H:%M:%S")}',
+            '',
+            'Queue counts:',
+            json.dumps(counts, indent=2, default=str),
+            '',
+            'Current queue filter:',
+            _text(self.queue_filter, 'All'),
+            '',
+            'Selected album:',
+            json.dumps(album or self.current_album or {}, indent=2, default=str),
+            '',
+            'Settings:',
+            json.dumps(settings, indent=2, default=str),
+            '',
+            'Details pane:',
+            self.details.toPlainText().strip(),
+            '',
+            'Recent activity:',
+            '\n'.join(_text(line) for line in recent_lines if _text(line)).strip(),
+        ]
+        return '\n'.join(payload).rstrip() + '\n'
+
+    def export_diagnostics(self) -> None:
+        try:
+            REPORT_DIR.mkdir(parents=True, exist_ok=True)
+            default = REPORT_DIR / f'artwork_manager_diagnostics_{time.strftime("%Y%m%d_%H%M%S")}.txt'
+            path, _selected_filter = QFileDialog.getSaveFileName(
+                self,
+                'Export Diagnostics',
+                str(default),
+                'Text files (*.txt);;All files (*)',
+            )
+            if not path:
+                return
+            Path(path).write_text(self.diagnostics_text(), encoding='utf-8')
+            message = f'Diagnostics exported: {path}'
+            self.approval_status.setText(message)
+            self.statusBar().showMessage(message)
+            QMessageBox.information(self, 'Diagnostics exported', f'Saved diagnostics to:\n{path}')
+        except Exception as exc:
+            QMessageBox.warning(self, 'Diagnostics export failed', str(exc))
 
     def repair_stale_candidate_rows(self) -> None:
         if self.repair_worker is not None and self.repair_worker.isRunning():
