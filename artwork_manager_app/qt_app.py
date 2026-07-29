@@ -793,6 +793,122 @@ class AlbumRescanWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class LocateAlbumFolderWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, album: Dict[str, Any], folder: str, settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.album = dict(album or {})
+        self.folder = _text(folder)
+        self.settings = dict(settings or {})
+
+    def run(self) -> None:
+        try:
+            album_key = _text(self.album.get('album_key'))
+            old_path = _text(self.album.get('album_path'))
+            if not album_key:
+                raise ValueError('The selected album has no saved queue id.')
+            if not self.folder or not os.path.isdir(self.folder):
+                raise ValueError('The selected folder could not be found.')
+            try:
+                names = sorted(os.listdir(self.folder), key=lambda item: item.lower())
+            except Exception as exc:
+                raise ValueError(f'Could not read the selected folder: {exc}') from exc
+            music = [
+                name for name in names
+                if os.path.isfile(os.path.join(self.folder, name)) and name.lower().endswith(MUSIC_EXTENSIONS)
+            ]
+            if not music:
+                db.update_album_path(album_key, self.folder)
+                db.update_album_notes(album_key, {
+                    'path_repaired_at': db.now(),
+                    'path_repaired_from': old_path,
+                    'path_repaired_to': self.folder,
+                    'path_repaired_warning': 'no supported music files found',
+                })
+                self.completed.emit({
+                    'album_key': album_key,
+                    'album_path': self.folder,
+                    'message': 'Album folder path updated. No supported music files were found to refresh artwork metadata.',
+                })
+                return
+
+            library_root = _library_root_for_album_path(self.folder)
+            identity = inspect_album_identity(self.folder, library_root, music)
+            row = analyze_album_folder(
+                self.folder,
+                library_root,
+                include_missing=True,
+                music_files=music,
+                identity=identity,
+                force_deep_check=False,
+            )
+            if not row:
+                db.update_album_path(album_key, self.folder)
+                db.update_album_notes(album_key, {
+                    'path_repaired_at': db.now(),
+                    'path_repaired_from': old_path,
+                    'path_repaired_to': self.folder,
+                    'path_repaired_warning': 'album metadata could not be refreshed',
+                })
+                self.completed.emit({
+                    'album_key': album_key,
+                    'album_path': self.folder,
+                    'message': 'Album folder path updated. Artwork metadata could not be refreshed.',
+                })
+                return
+
+            artist, album_name, width, height, example, album_path, generated_key, identity = row
+            width_value = None if width == 'Missing' else width
+            height_value = None if height == 'Missing' else height
+            try:
+                candidate_count = len(db.load_candidates_for_album(album_key, include_rejected=False))
+            except Exception:
+                candidate_count = 0
+            fresh = db.get_album(album_key) or self.album
+            status, status_reason = evaluate_album_state(
+                width_value,
+                height_value,
+                identity.get('notes') or {},
+                current_status=_text(fresh.get('status'), 'needs_review'),
+                candidate_count=candidate_count,
+                preserve_user_terminal=True,
+                settings=self.settings,
+            )
+            identity = dict(identity or {})
+            notes = dict(identity.get('notes') or {})
+            notes.update({
+                'path_repaired_at': db.now(),
+                'path_repaired_from': old_path,
+                'path_repaired_to': album_path,
+                'state_evaluation': {'status': status, 'reason': status_reason},
+            })
+            if generated_key and generated_key != album_key:
+                notes['path_repaired_generated_key'] = generated_key
+            identity['notes'] = notes
+            db.upsert_album(
+                album_key,
+                artist,
+                album_name,
+                album_path,
+                status=status,
+                width=width_value,
+                height=height_value,
+                example_file=example,
+                meta=identity,
+            )
+            self.completed.emit({
+                'album_key': album_key,
+                'album_path': album_path,
+                'status': status,
+                'reason': status_reason,
+                'message': 'Album folder path updated and refreshed from disk.',
+            })
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class AlbumDeepCheckWorker(QThread):
     completed = Signal(object)
     failed = Signal(str)
@@ -2142,6 +2258,7 @@ class QtArtworkWindow(QMainWindow):
         self.convert_worker: Optional[ConvertSaveWorker] = None
         self.search_worker: Optional[SearchWorker] = None
         self.album_rescan_worker: Optional[AlbumRescanWorker] = None
+        self.locate_folder_worker: Optional[LocateAlbumFolderWorker] = None
         self.deep_check_worker: Optional[AlbumDeepCheckWorker] = None
         self.repair_worker: Optional[RepairStaleCandidatesWorker] = None
         self.scan_dialog: Optional[ScanDialog] = None
@@ -2400,6 +2517,8 @@ class QtArtworkWindow(QMainWindow):
         self.search_more_action.triggered.connect(self.search_more_for_current_album)
         self.refresh_album_action = QAction(_line_icon('refresh'), 'Refresh From Disk', self)
         self.refresh_album_action.triggered.connect(self.refresh_current_album_from_disk)
+        self.locate_folder_action = QAction(_line_icon('folder'), 'Locate Album Folder...', self)
+        self.locate_folder_action.triggered.connect(self.locate_album_folder)
         self.problem_files_action = QAction(_line_icon('scan'), 'Show Problem Files', self)
         self.problem_files_action.triggered.connect(self.show_problem_files_for_current_album)
         self.backup_restore_action = QAction(_line_icon('folder'), 'Backup / Restore', self)
@@ -2422,6 +2541,7 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu.addAction(self.choose_release_action)
         self.more_menu.addAction(self.search_more_action)
         self.more_menu.addAction(self.refresh_album_action)
+        self.more_menu.addAction(self.locate_folder_action)
         self.more_menu.addAction(self.problem_files_action)
         self.more_menu.addAction(self.backup_restore_action)
         self.more_menu.addAction(self.repair_stale_action)
@@ -3164,9 +3284,10 @@ class QtArtworkWindow(QMainWindow):
         convert_busy = self.convert_worker is not None and self.convert_worker.isRunning()
         search_busy = self.search_worker is not None and self.search_worker.isRunning()
         rescan_busy = self.album_rescan_worker is not None and self.album_rescan_worker.isRunning()
+        locate_busy = self.locate_folder_worker is not None and self.locate_folder_worker.isRunning()
         deep_check_busy = self.deep_check_worker is not None and self.deep_check_worker.isRunning()
         repair_busy = self.repair_worker is not None and self.repair_worker.isRunning()
-        busy = approval_busy or convert_busy or search_busy or rescan_busy or deep_check_busy or repair_busy
+        busy = approval_busy or convert_busy or search_busy or rescan_busy or locate_busy or deep_check_busy or repair_busy
         album = self.current_album or {}
         bucket = self._album_bucket(album) if album else ''
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
@@ -3195,6 +3316,7 @@ class QtArtworkWindow(QMainWindow):
         self.choose_release_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'} and not busy))
         self.search_more_action.setEnabled(bool(can_search and not busy))
         self.refresh_album_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
+        self.locate_folder_action.setEnabled(bool(has_album_key and not busy))
         self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.backup_restore_action.setEnabled(not busy)
         self.repair_stale_action.setEnabled(not busy)
@@ -3862,6 +3984,82 @@ class QtArtworkWindow(QMainWindow):
             self.album_rescan_worker = None
         self._refresh_action_states()
 
+    def _existing_folder_for_dialog(self, path: Any = '') -> str:
+        candidate = _text(path) or _text(self.settings.get('last_library_path')) or str(Path.home())
+        candidate_path = Path(candidate).expanduser()
+        while candidate and not candidate_path.is_dir():
+            parent = candidate_path.parent
+            if parent == candidate_path:
+                break
+            candidate_path = parent
+            candidate = str(candidate_path)
+        if not candidate_path.is_dir():
+            return str(Path.home())
+        return str(candidate_path)
+
+    def locate_album_folder(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        if not album_key:
+            return
+        if self.locate_folder_worker is not None and self.locate_folder_worker.isRunning():
+            return
+        start = self._existing_folder_for_dialog(album.get('album_path'))
+        folder = QFileDialog.getExistingDirectory(self, 'Locate Album Folder', start)
+        if not folder:
+            return
+        if not os.path.isdir(folder):
+            QMessageBox.warning(self, 'Folder unavailable', 'That folder is not available.')
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        label = self._album_display_name(album)
+        self.approval_status.setText(f'Updating folder path: {label}...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Locating selected album folder...')
+        worker = LocateAlbumFolderWorker(album, folder, self.settings, self)
+        worker.completed.connect(self._locate_folder_completed)
+        worker.failed.connect(self._locate_folder_failed)
+        worker.finished.connect(lambda w=worker: self._locate_folder_worker_finished(w))
+        self.locate_folder_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
+    def _locate_folder_completed(self, result: object) -> None:
+        result = dict(result or {})
+        self.approval_progress.setVisible(False)
+        album_key = _text(result.get('album_key'))
+        message = _text(result.get('message'), 'Album folder path updated.')
+        if result.get('reason'):
+            message = f"{message} {result.get('reason')}"
+        self.reload_queue(select_first=False)
+        if album_key and not self._select_album_key(album_key, fallback_first=False):
+            target_filter = self._queue_filter_for_album_key(album_key)
+            if target_filter:
+                self.queue_filter = target_filter
+                self.apply_filters()
+                self._schedule_queue_filter_state_save()
+                self._select_album_key(album_key, fallback_first=True)
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        self._refresh_action_states()
+
+    def _locate_folder_failed(self, message: str) -> None:
+        self.approval_progress.setVisible(False)
+        message = _text(message, 'Album folder update failed.')
+        self.approval_status.setText(message)
+        self.statusBar().showMessage('Album folder update failed')
+        QMessageBox.warning(self, 'Locate album folder failed', message)
+        self._refresh_action_states()
+
+    def _locate_folder_worker_finished(self, worker: LocateAlbumFolderWorker) -> None:
+        if self.locate_folder_worker is worker:
+            self.locate_folder_worker = None
+        self._refresh_action_states()
+
     def show_problem_files_for_current_album(self) -> None:
         album = self.current_album or {}
         album_key = _text(album.get('album_key'))
@@ -4437,6 +4635,10 @@ class QtArtworkWindow(QMainWindow):
             QMessageBox.information(self, 'Refresh still running', 'Wait for the selected album refresh to finish before closing Artwork Manager.')
             event.ignore()
             return
+        if self.locate_folder_worker is not None and self.locate_folder_worker.isRunning():
+            QMessageBox.information(self, 'Folder update still running', 'Wait for the album folder update to finish before closing Artwork Manager.')
+            event.ignore()
+            return
         if self.deep_check_worker is not None and self.deep_check_worker.isRunning():
             QMessageBox.information(self, 'Problem file check still running', 'Wait for the selected album check to finish before closing Artwork Manager.')
             event.ignore()
@@ -4476,6 +4678,11 @@ class QtArtworkWindow(QMainWindow):
         if self.convert_worker is not None:
             try:
                 self.convert_worker.wait(500)
+            except Exception:
+                pass
+        if self.locate_folder_worker is not None:
+            try:
+                self.locate_folder_worker.wait(500)
             except Exception:
                 pass
         if self.repair_worker is not None:
