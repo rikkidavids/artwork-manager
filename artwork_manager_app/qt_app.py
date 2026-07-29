@@ -63,7 +63,9 @@ from . import database as db
 from .embedder import list_embed_backups, restore_embed_history
 from .config import (
     APP_DIR,
+    APPROVED_DIR,
     BUILD_VERSION,
+    DATA_DIR,
     IMPORT_DIR,
     TEMP_DIR,
     get_batch_search_count,
@@ -154,6 +156,82 @@ def _text(value: Any, fallback: str = '') -> str:
     value = '' if value is None else str(value)
     value = value.strip()
     return value if value else fallback
+
+
+def _bytes_text(total: Any) -> str:
+    try:
+        total = int(total or 0)
+        if total >= 1024 * 1024 * 1024:
+            return f'{total / (1024 * 1024 * 1024):.1f} GB'
+        if total >= 1024 * 1024:
+            return f'{total / (1024 * 1024):.1f} MB'
+        return f'{total // 1024} KB'
+    except Exception:
+        return 'unknown'
+
+
+def _folder_size(path: Any) -> int:
+    total = 0
+    try:
+        root = Path(path)
+        if root.exists():
+            for item in root.rglob('*'):
+                try:
+                    if item.is_file():
+                        total += item.stat().st_size
+                except Exception:
+                    pass
+    except Exception:
+        return 0
+    return total
+
+
+def _folder_size_text(path: Any) -> str:
+    return _bytes_text(_folder_size(path))
+
+
+def _path_inside_roots(path: Any, roots: tuple[Path, ...]) -> bool:
+    try:
+        candidate = Path(str(path or '')).expanduser().resolve()
+    except Exception:
+        return False
+    for root in roots:
+        try:
+            root_path = Path(root).expanduser().resolve()
+            if os.path.commonpath([str(candidate), str(root_path)]) == str(root_path):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _mac_trash_dir() -> Path:
+    trash_dir = Path.home() / '.Trash'
+    trash_dir.mkdir(parents=True, exist_ok=True)
+    return trash_dir
+
+
+def _trash_managed_file(path: Any, roots: tuple[Path, ...]) -> tuple[int, int]:
+    if not path or not _path_inside_roots(path, roots):
+        return 0, 0
+    try:
+        src = Path(str(path)).expanduser()
+        if not src.exists() or not src.is_file():
+            return 0, 0
+        freed = src.stat().st_size
+        trash_dir = _mac_trash_dir()
+        dest = trash_dir / src.name
+        if dest.exists():
+            stem = src.stem
+            suffix = src.suffix
+            index = 1
+            while dest.exists():
+                dest = trash_dir / f'{stem}-{index}{suffix}'
+                index += 1
+        shutil.move(str(src), str(dest))
+        return 1, freed
+    except Exception:
+        return 0, 0
 
 
 def _album_size(album: Dict[str, Any]) -> str:
@@ -1047,6 +1125,117 @@ class RepairStaleCandidatesWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class StorageCleanupWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, mode: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.mode = _text(mode)
+
+    def run(self) -> None:
+        try:
+            if self.mode == 'handled-temp':
+                result = self._clean_handled_temp()
+            elif self.mode == 'orphan-temp':
+                result = self._clean_orphan_temp()
+            elif self.mode == 'approved-copies':
+                result = self._clean_approved_copies()
+            else:
+                raise ValueError('Unknown cleanup mode.')
+            result['mode'] = self.mode
+            self.completed.emit(result)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+    def _clean_handled_temp(self) -> Dict[str, Any]:
+        with db.connect() as c:
+            rows = c.execute('''
+                SELECT c.image_path
+                FROM candidates c
+                JOIN albums a ON a.album_key=c.album_key
+                WHERE a.status IN ('approved','reviewed_skipped','already_good','ignored')
+                  AND c.image_path IS NOT NULL AND c.image_path<>''
+            ''').fetchall()
+        removed = 0
+        freed = 0
+        skipped = 0
+        seen = set()
+        for row in rows:
+            path = _text(row['image_path'])
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            if not _path_inside_roots(path, (TEMP_DIR, IMPORT_DIR)):
+                skipped += 1
+                continue
+            count, size = _trash_managed_file(path, (TEMP_DIR, IMPORT_DIR))
+            removed += count
+            freed += size
+        return {
+            'removed': removed,
+            'freed': freed,
+            'checked': len(rows),
+            'skipped': skipped,
+            'label': 'handled temporary artwork',
+        }
+
+    def _candidate_paths_from_db(self) -> set[str]:
+        paths = set()
+        try:
+            rows = db.all_candidate_file_rows(include_rejected=True)
+            for row in rows:
+                path = _text(row.get('image_path'))
+                if path:
+                    paths.add(path)
+        except Exception:
+            pass
+        return paths
+
+    def _clean_orphan_temp(self) -> Dict[str, Any]:
+        referenced = self._candidate_paths_from_db()
+        removed = 0
+        freed = 0
+        checked = 0
+        for root in (TEMP_DIR, IMPORT_DIR):
+            root.mkdir(parents=True, exist_ok=True)
+            for path in root.rglob('*'):
+                if not path.is_file():
+                    continue
+                checked += 1
+                path_text = str(path)
+                if path_text in referenced:
+                    continue
+                count, size = _trash_managed_file(path, (TEMP_DIR, IMPORT_DIR))
+                removed += count
+                freed += size
+        return {
+            'removed': removed,
+            'freed': freed,
+            'checked': checked,
+            'skipped': max(0, checked - removed),
+            'label': 'orphan temporary artwork',
+        }
+
+    def _clean_approved_copies(self) -> Dict[str, Any]:
+        files = []
+        if APPROVED_DIR.exists():
+            files = [path for path in APPROVED_DIR.rglob('*') if path.is_file()]
+        removed = 0
+        freed = 0
+        for path in files:
+            count, size = _trash_managed_file(path, (APPROVED_DIR,))
+            removed += count
+            freed += size
+        return {
+            'removed': removed,
+            'freed': freed,
+            'checked': len(files),
+            'skipped': max(0, len(files) - removed),
+            'label': 'approved artwork copies',
+        }
+
+
 class LibraryScanWorker(QThread):
     progress = Signal(int, int, str)
     album_queued = Signal(object)
@@ -1110,6 +1299,8 @@ class SettingsDialog(QDialog):
         self.edits: Dict[str, QLineEdit] = {}
         self.target_mode = QComboBox()
         self.nas_check_worker: Optional[NasWorkerCheckWorker] = None
+        self.storage_cleanup_worker: Optional[StorageCleanupWorker] = None
+        self.storage_cleanup_buttons: List[QPushButton] = []
 
         self.setWindowTitle('Settings')
         self.resize(680, 620)
@@ -1122,6 +1313,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._scroll_tab(self._build_artwork_tab()), 'Artwork')
         tabs.addTab(self._scroll_tab(self._build_providers_tab()), 'Providers')
         tabs.addTab(self._scroll_tab(self._build_nas_tab()), 'NAS Worker')
+        tabs.addTab(self._scroll_tab(self._build_storage_tab()), 'Storage')
         layout.addWidget(tabs, 1)
 
         buttons = QDialogButtonBox()
@@ -1270,6 +1462,135 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return body
 
+    def _build_storage_tab(self) -> QWidget:
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(2, 2, 8, 2)
+        layout.setSpacing(12)
+
+        group = QGroupBox('App Storage')
+        group_layout = QVBoxLayout(group)
+        self.storage_summary_label = QLabel(self._storage_summary_text())
+        self.storage_summary_label.setObjectName('mutedLabel')
+        self.storage_summary_label.setWordWrap(True)
+        group_layout.addWidget(self.storage_summary_label)
+
+        buttons = QGridLayout()
+        buttons.setHorizontalSpacing(8)
+        buttons.setVerticalSpacing(8)
+        self.clean_handled_temp_btn = QPushButton('Clean Handled Temp')
+        self.clean_handled_temp_btn.setObjectName('quietButton')
+        self.clean_handled_temp_btn.clicked.connect(lambda: self._confirm_storage_cleanup('handled-temp'))
+        self.clean_orphan_temp_btn = QPushButton('Clean Orphan Temp')
+        self.clean_orphan_temp_btn.setObjectName('quietButton')
+        self.clean_orphan_temp_btn.clicked.connect(lambda: self._confirm_storage_cleanup('orphan-temp'))
+        self.clean_approved_btn = QPushButton('Trash Approved Copies')
+        self.clean_approved_btn.setObjectName('quietButton')
+        self.clean_approved_btn.clicked.connect(lambda: self._confirm_storage_cleanup('approved-copies'))
+        self.open_data_btn = QPushButton('Open App Data Folder')
+        self.open_data_btn.setObjectName('quietButton')
+        self.open_data_btn.setIcon(_line_icon('folder'))
+        self.open_data_btn.setIconSize(QSize(16, 16))
+        self.open_data_btn.clicked.connect(lambda: open_path(DATA_DIR))
+        for button in (self.clean_handled_temp_btn, self.clean_orphan_temp_btn, self.clean_approved_btn, self.open_data_btn):
+            self.storage_cleanup_buttons.append(button)
+        buttons.addWidget(self.clean_handled_temp_btn, 0, 0)
+        buttons.addWidget(self.clean_orphan_temp_btn, 0, 1)
+        buttons.addWidget(self.clean_approved_btn, 1, 0)
+        buttons.addWidget(self.open_data_btn, 1, 1)
+        group_layout.addLayout(buttons)
+
+        hint = QLabel('Music files and embedded artwork are not changed.')
+        hint.setObjectName('mutedLabel')
+        hint.setWordWrap(True)
+        group_layout.addWidget(hint)
+
+        self.storage_result_label = QLabel('')
+        self.storage_result_label.setObjectName('mutedLabel')
+        self.storage_result_label.setWordWrap(True)
+        group_layout.addWidget(self.storage_result_label)
+        layout.addWidget(group)
+        layout.addStretch(1)
+        return body
+
+    def _storage_summary_text(self) -> str:
+        return (
+            f'Temporary candidates: {_folder_size_text(TEMP_DIR)}   '
+            f'Manual imports: {_folder_size_text(IMPORT_DIR)}   '
+            f'Approved copies: {_folder_size_text(APPROVED_DIR)}'
+        )
+
+    def _refresh_storage_summary(self) -> None:
+        try:
+            self.storage_summary_label.setText(self._storage_summary_text())
+        except Exception:
+            pass
+
+    def _storage_cleanup_busy(self) -> bool:
+        return self.storage_cleanup_worker is not None and self.storage_cleanup_worker.isRunning()
+
+    def _set_storage_cleanup_busy(self, busy: bool, text: str = '') -> None:
+        for button in self.storage_cleanup_buttons:
+            button.setEnabled(not busy)
+        if text:
+            self.storage_result_label.setText(text)
+
+    def _confirm_storage_cleanup(self, mode: str) -> None:
+        if self._storage_cleanup_busy():
+            return
+        prompts = {
+            'handled-temp': (
+                'Clean handled temp artwork?',
+                'Move app-managed temporary artwork for finished albums to the Trash?',
+            ),
+            'orphan-temp': (
+                'Clean orphan temp artwork?',
+                'Move app-managed temporary artwork that is no longer linked to saved options to the Trash?',
+            ),
+            'approved-copies': (
+                'Trash approved copies?',
+                'Move saved approved-artwork copy files to the Trash?',
+            ),
+        }
+        title, text = prompts.get(mode, ('Clean storage?', 'Move app-managed files to the Trash?'))
+        answer = QMessageBox.question(self, title, text, QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+        self._start_storage_cleanup(mode)
+
+    def _start_storage_cleanup(self, mode: str) -> None:
+        self._set_storage_cleanup_busy(True, 'Cleaning storage...')
+        worker = StorageCleanupWorker(mode, self)
+        worker.completed.connect(self._storage_cleanup_completed)
+        worker.failed.connect(self._storage_cleanup_failed)
+        worker.finished.connect(lambda w=worker: self._storage_cleanup_worker_finished(w))
+        self.storage_cleanup_worker = worker
+        worker.start()
+
+    def _storage_cleanup_completed(self, result: object) -> None:
+        result = dict(result or {})
+        removed = int(result.get('removed') or 0)
+        freed = int(result.get('freed') or 0)
+        label = _text(result.get('label'), 'files')
+        message = f'Cleaned {removed} {label} file(s), about {_bytes_text(freed)}.'
+        skipped = int(result.get('skipped') or 0)
+        if skipped:
+            message += f' {skipped} skipped.'
+        self.storage_result_label.setText(message)
+        self._refresh_storage_summary()
+        self._set_storage_cleanup_busy(False)
+
+    def _storage_cleanup_failed(self, message: str) -> None:
+        message = _text(message, 'Storage cleanup failed.')
+        self.storage_result_label.setText(message)
+        self._set_storage_cleanup_busy(False)
+        QMessageBox.warning(self, 'Storage cleanup failed', message)
+
+    def _storage_cleanup_worker_finished(self, worker: StorageCleanupWorker) -> None:
+        if self.storage_cleanup_worker is worker:
+            self.storage_cleanup_worker = None
+        self._set_storage_cleanup_busy(False)
+
     def _current_settings(self) -> Dict[str, Any]:
         settings = {
             'provider_order': self.settings.get('provider_order') or ['deezer', 'itunes', 'musicbrainz', 'discogs', 'fanarttv'],
@@ -1371,9 +1692,16 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, 'NAS worker check running', 'Wait for the NAS worker check to finish before closing Settings.')
             event.ignore()
             return
+        if self._storage_cleanup_busy():
+            QMessageBox.information(self, 'Storage cleanup running', 'Wait for storage cleanup to finish before closing Settings.')
+            event.ignore()
+            return
         super().closeEvent(event)
 
     def save(self) -> None:
+        if self._storage_cleanup_busy():
+            QMessageBox.information(self, 'Storage cleanup running', 'Wait for storage cleanup to finish before saving Settings.')
+            return
         try:
             save_settings(self._current_settings())
             self.settings = load_settings()
@@ -3580,42 +3908,11 @@ class QtArtworkWindow(QMainWindow):
         self._refresh_action_states()
 
     def _is_path_inside_roots(self, path: Any, roots: tuple[Path, ...]) -> bool:
-        try:
-            candidate = Path(str(path or '')).expanduser().resolve()
-        except Exception:
-            return False
-        for root in roots:
-            try:
-                root_path = Path(root).expanduser().resolve()
-                common = os.path.commonpath([str(candidate), str(root_path)])
-                if common == str(root_path):
-                    return True
-            except Exception:
-                continue
-        return False
+        return _path_inside_roots(path, roots)
 
     def _trash_managed_candidate_file(self, path: Any) -> int:
-        if not path or not self._is_path_inside_roots(path, (TEMP_DIR, IMPORT_DIR)):
-            return 0
-        try:
-            src = Path(str(path)).expanduser()
-            if not src.exists() or not src.is_file():
-                return 0
-            trash_dir = Path.home() / '.Trash'
-            if not trash_dir.exists():
-                return 0
-            dest = trash_dir / src.name
-            if dest.exists():
-                stem = src.stem
-                suffix = src.suffix
-                index = 1
-                while dest.exists():
-                    dest = trash_dir / f'{stem}-{index}{suffix}'
-                    index += 1
-            shutil.move(str(src), str(dest))
-            return 1
-        except Exception:
-            return 0
+        removed, _freed = _trash_managed_file(path, (TEMP_DIR, IMPORT_DIR))
+        return removed
 
     def _remove_candidate_files(self, candidates: List[Dict[str, Any]]) -> int:
         removed = 0
