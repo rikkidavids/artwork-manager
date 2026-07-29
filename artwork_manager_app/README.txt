@@ -1,5 +1,7 @@
-Build 4.91 — Qt workflow polish
+Build 4.92 — Qt provider order and undo
 
+- Added Qt provider search-order controls in Settings, with Move Up, Move Down, and Recommended ordering.
+- Added Qt Undo Last Embed under Album Tools > Maintenance for quickly restoring the most recent backed-up embed while testing.
 - Cleaned the Qt review surface by moving Import, folder/source links, backup, diagnostics, and repair tools into a grouped Album Tools menu.
 - Hid Search Next when it cannot act, softened empty artwork placeholders, and made saved queue columns fit the visible pane more gracefully.
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.

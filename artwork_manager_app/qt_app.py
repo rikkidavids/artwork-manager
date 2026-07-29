@@ -62,7 +62,7 @@ from .approval import (
     convert_embedded_artwork,
 )
 from . import database as db
-from .embedder import list_embed_backups, restore_embed_history
+from .embedder import list_embed_backups, restore_embed_history, undo_last_embed
 from .config import (
     APP_DIR,
     APPROVED_DIR,
@@ -125,6 +125,14 @@ PROVIDER_OPTIONS = (
     ('discogs_enabled', 'Discogs'),
     ('fanarttv_enabled', 'fanart.tv'),
 )
+PROVIDER_ORDER_KEYS = ('deezer', 'itunes', 'musicbrainz', 'discogs', 'fanarttv')
+PROVIDER_ORDER_LABELS = {
+    'deezer': 'Deezer',
+    'itunes': 'Apple / iTunes',
+    'musicbrainz': 'MusicBrainz / Cover Art Archive',
+    'discogs': 'Discogs',
+    'fanarttv': 'fanart.tv',
+}
 QUEUE_COLUMNS = ('status', 'artist', 'album', 'current', 'candidates')
 DEFAULT_QUEUE_COLUMN_WIDTHS = {
     'status': 96,
@@ -1080,6 +1088,17 @@ class RestoreBackupWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class UndoLastEmbedWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(undo_last_embed())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class RepairStaleCandidatesWorker(QThread):
     completed = Signal(object)
     failed = Signal(str)
@@ -1363,6 +1382,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = dict(settings or {})
         self.provider_checks: Dict[str, QCheckBox] = {}
+        self.provider_order_list: Optional[QListWidget] = None
         self.spinboxes: Dict[str, QSpinBox] = {}
         self.checkboxes: Dict[str, QCheckBox] = {}
         self.edits: Dict[str, QLineEdit] = {}
@@ -1479,16 +1499,102 @@ class SettingsDialog(QDialog):
             group_layout.addWidget(check)
         layout.addWidget(group)
 
+        order_group = QGroupBox('Search Order')
+        order_layout = QHBoxLayout(order_group)
+        self.provider_order_list = QListWidget()
+        self.provider_order_list.setObjectName('providerOrderList')
+        self.provider_order_list.setSelectionMode(QListWidget.SingleSelection)
+        self.provider_order_list.setFixedHeight(156)
+        order_layout.addWidget(self.provider_order_list, 1)
+
+        order_buttons = QVBoxLayout()
+        self.provider_up_btn = QPushButton('Move Up')
+        self.provider_up_btn.setObjectName('quietButton')
+        self.provider_up_btn.clicked.connect(lambda: self._move_provider_order(-1))
+        self.provider_down_btn = QPushButton('Move Down')
+        self.provider_down_btn.setObjectName('quietButton')
+        self.provider_down_btn.clicked.connect(lambda: self._move_provider_order(1))
+        self.provider_reset_btn = QPushButton('Recommended')
+        self.provider_reset_btn.setObjectName('quietButton')
+        self.provider_reset_btn.clicked.connect(self._reset_provider_order)
+        order_buttons.addWidget(self.provider_up_btn)
+        order_buttons.addWidget(self.provider_down_btn)
+        order_buttons.addSpacing(8)
+        order_buttons.addWidget(self.provider_reset_btn)
+        order_buttons.addStretch(1)
+        order_layout.addLayout(order_buttons)
+        layout.addWidget(order_group)
+        self._refresh_provider_order_list()
+
         discogs = QGroupBox('Discogs')
         discogs_form = QFormLayout(discogs)
         discogs_form.addRow('Token', self._edit('discogs_token', 'Optional fallback search token', password=True))
-        hint = QLabel('Provider order is preserved from your existing settings; this dialog keeps the common on/off controls simple.')
+        hint = QLabel('Enabled providers are searched from top to bottom. Disabled providers stay in the order but are skipped.')
         hint.setObjectName('mutedLabel')
         hint.setWordWrap(True)
         discogs_form.addRow('', hint)
         layout.addWidget(discogs)
         layout.addStretch(1)
         return body
+
+    def _provider_order_from_settings(self) -> List[str]:
+        raw = self.settings.get('provider_order') or []
+        order: List[str] = []
+        for key in raw:
+            key = _text(key)
+            if key in PROVIDER_ORDER_KEYS and key not in order:
+                order.append(key)
+        for key in PROVIDER_ORDER_KEYS:
+            if key not in order:
+                order.append(key)
+        return order
+
+    def _refresh_provider_order_list(self, selected_key: str = '') -> None:
+        if self.provider_order_list is None:
+            return
+        current_key = selected_key
+        if not current_key:
+            item = self.provider_order_list.currentItem()
+            current_key = _text(item.data(Qt.UserRole)) if item else ''
+        self.provider_order_list.clear()
+        selected_row = 0
+        for row, key in enumerate(self._provider_order_from_settings()):
+            item = QListWidgetItem(PROVIDER_ORDER_LABELS.get(key, key))
+            item.setData(Qt.UserRole, key)
+            self.provider_order_list.addItem(item)
+            if key == current_key:
+                selected_row = row
+        if self.provider_order_list.count():
+            self.provider_order_list.setCurrentRow(max(0, min(selected_row, self.provider_order_list.count() - 1)))
+
+    def _current_provider_order(self) -> List[str]:
+        if self.provider_order_list is None:
+            return self._provider_order_from_settings()
+        order: List[str] = []
+        for row in range(self.provider_order_list.count()):
+            key = _text(self.provider_order_list.item(row).data(Qt.UserRole))
+            if key in PROVIDER_ORDER_KEYS and key not in order:
+                order.append(key)
+        for key in PROVIDER_ORDER_KEYS:
+            if key not in order:
+                order.append(key)
+        return order
+
+    def _move_provider_order(self, direction: int) -> None:
+        if self.provider_order_list is None:
+            return
+        row = self.provider_order_list.currentRow()
+        target = row + int(direction)
+        if row < 0 or target < 0 or target >= self.provider_order_list.count():
+            return
+        item = self.provider_order_list.takeItem(row)
+        self.provider_order_list.insertItem(target, item)
+        self.provider_order_list.setCurrentRow(target)
+        self.settings['provider_order'] = self._current_provider_order()
+
+    def _reset_provider_order(self) -> None:
+        self.settings['provider_order'] = list(PROVIDER_ORDER_KEYS)
+        self._refresh_provider_order_list('deezer')
 
     def _build_nas_tab(self) -> QWidget:
         body = QWidget()
@@ -1662,7 +1768,7 @@ class SettingsDialog(QDialog):
 
     def _current_settings(self) -> Dict[str, Any]:
         settings = {
-            'provider_order': self.settings.get('provider_order') or ['deezer', 'itunes', 'musicbrainz', 'discogs', 'fanarttv'],
+            'provider_order': self._current_provider_order(),
             'target_size_match_mode': self.target_mode.currentText() if self.target_mode.currentText() in {'Relaxed', 'Strict'} else 'Relaxed',
         }
         for key, check in self.provider_checks.items():
@@ -2666,6 +2772,7 @@ class QtArtworkWindow(QMainWindow):
         self.deep_check_worker: Optional[AlbumDeepCheckWorker] = None
         self.repair_worker: Optional[RepairStaleCandidatesWorker] = None
         self.queue_repair_worker: Optional[QueueStateRepairWorker] = None
+        self.undo_worker: Optional[UndoLastEmbedWorker] = None
         self.scan_dialog: Optional[ScanDialog] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
         self.last_convert_result: Optional[Dict[str, Any]] = None
@@ -2954,6 +3061,8 @@ class QtArtworkWindow(QMainWindow):
         self.backup_before_embed_action.setChecked(bool(self.settings.get('backup_before_embedding', False)))
         self.backup_before_embed_action.setToolTip('Save music-file backups before embedding')
         self.backup_before_embed_action.toggled.connect(self._save_backup_preference)
+        self.undo_last_embed_action = QAction(_line_icon('refresh'), 'Undo Last Embed', self)
+        self.undo_last_embed_action.triggered.connect(self.undo_last_embed)
         self.convert_save_action = QAction(_line_icon('refresh'), 'Convert/Save Current Artwork', self)
         self.convert_save_action.triggered.connect(self.convert_save_current_artwork)
         self.convert_save_next_action = QAction(_line_icon('refresh'), 'Convert/Save Next', self)
@@ -2990,6 +3099,7 @@ class QtArtworkWindow(QMainWindow):
 
         maintenance_menu = self.more_menu.addMenu(_line_icon('scan'), 'Maintenance')
         maintenance_menu.addAction(self.backup_before_embed_action)
+        maintenance_menu.addAction(self.undo_last_embed_action)
         maintenance_menu.addAction(self.backup_restore_action)
         maintenance_menu.addAction(self.export_diagnostics_action)
         maintenance_menu.addSeparator()
@@ -3735,7 +3845,8 @@ class QtArtworkWindow(QMainWindow):
         deep_check_busy = self.deep_check_worker is not None and self.deep_check_worker.isRunning()
         repair_busy = self.repair_worker is not None and self.repair_worker.isRunning()
         queue_repair_busy = self.queue_repair_worker is not None and self.queue_repair_worker.isRunning()
-        busy = approval_busy or convert_busy or search_busy or rescan_busy or locate_busy or deep_check_busy or repair_busy or queue_repair_busy
+        undo_busy = self.undo_worker is not None and self.undo_worker.isRunning()
+        busy = approval_busy or convert_busy or search_busy or rescan_busy or locate_busy or deep_check_busy or repair_busy or queue_repair_busy or undo_busy
         album = self.current_album or {}
         bucket = self._album_bucket(album) if album else ''
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
@@ -3768,6 +3879,7 @@ class QtArtworkWindow(QMainWindow):
         self.locate_folder_action.setEnabled(bool(has_album_key and not busy))
         self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.backup_restore_action.setEnabled(not busy)
+        self.undo_last_embed_action.setEnabled(not busy)
         self.export_diagnostics_action.setEnabled(not busy)
         self.repair_stale_action.setEnabled(not busy)
         self.repair_queue_action.setEnabled(not busy)
@@ -4662,6 +4774,59 @@ class QtArtworkWindow(QMainWindow):
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
 
+    def undo_last_embed(self) -> None:
+        if self.undo_worker is not None and self.undo_worker.isRunning():
+            return
+        answer = QMessageBox.question(
+            self,
+            'Undo last embed?',
+            'Restore the music files from the most recent backed-up embed?\n\nThis only works for embeds where Backup Before Embed was enabled.',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            self.statusBar().showMessage('Undo cancelled.')
+            return
+        self.approval_status.setText('Restoring last embed backup...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Undoing last embed...')
+        worker = UndoLastEmbedWorker(self)
+        worker.completed.connect(self._undo_last_embed_completed)
+        worker.failed.connect(self._undo_last_embed_failed)
+        worker.finished.connect(lambda w=worker: self._undo_last_embed_worker_finished(w))
+        self.undo_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
+    def _undo_last_embed_completed(self, result: object) -> None:
+        result = dict(result or {})
+        restored = int(result.get('restored') or 0)
+        failed = len(result.get('failed') or [])
+        current_key = _text((self.current_album or {}).get('album_key'))
+        self.approval_progress.setVisible(False)
+        self.reload_queue(select_first=False)
+        if current_key:
+            self._select_album_key(current_key, fallback_first=True)
+        message = _text(result.get('message')) or f'Undo complete: restored {restored} file(s), {failed} failed.'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        QMessageBox.information(self, 'Undo Last Embed', message)
+        self._refresh_action_states()
+
+    def _undo_last_embed_failed(self, message: str) -> None:
+        message = _text(message, 'Undo failed.')
+        self.approval_progress.setVisible(False)
+        self.approval_status.setText(message)
+        self.statusBar().showMessage('Undo failed')
+        QMessageBox.warning(self, 'Undo Last Embed failed', message)
+        self._refresh_action_states()
+
+    def _undo_last_embed_worker_finished(self, worker: UndoLastEmbedWorker) -> None:
+        if self.undo_worker is worker:
+            self.undo_worker = None
+        self._refresh_action_states()
+
     def _redacted_settings(self, settings: Dict[str, Any]) -> Dict[str, Any]:
         redacted = {}
         for key, value in dict(settings or {}).items():
@@ -5219,6 +5384,10 @@ class QtArtworkWindow(QMainWindow):
             QMessageBox.information(self, 'Queue repair still running', 'Wait for queue repair to finish before closing Artwork Manager.')
             event.ignore()
             return
+        if self.undo_worker is not None and self.undo_worker.isRunning():
+            QMessageBox.information(self, 'Undo still running', 'Wait for the last-embed undo to finish before closing Artwork Manager.')
+            event.ignore()
+            return
         if self.convert_worker is not None and self.convert_worker.isRunning():
             QMessageBox.information(self, 'Convert/Save still running', 'Wait for the selected album Convert/Save to finish before closing Artwork Manager.')
             event.ignore()
@@ -5265,6 +5434,11 @@ class QtArtworkWindow(QMainWindow):
         if self.queue_repair_worker is not None:
             try:
                 self.queue_repair_worker.wait(500)
+            except Exception:
+                pass
+        if self.undo_worker is not None:
+            try:
+                self.undo_worker.wait(500)
             except Exception:
                 pass
         for worker in list(self.current_art_workers):
