@@ -1,5 +1,7 @@
-Build 4.90 — Qt diagnostics export
+Build 4.91 — Qt workflow polish
 
+- Cleaned the Qt review surface by moving Import, folder/source links, backup, diagnostics, and repair tools into a grouped Album Tools menu.
+- Hid Search Next when it cannot act, softened empty artwork placeholders, and made saved queue columns fit the visible pane more gracefully.
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added Qt Export Diagnostics so support reports can be saved from the modern app with sensitive tokens hidden.
 - Added Qt Repair Queue States to fix stale saved queue labels using existing database metadata without scanning NAS album folders.

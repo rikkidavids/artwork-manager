@@ -127,18 +127,18 @@ PROVIDER_OPTIONS = (
 )
 QUEUE_COLUMNS = ('status', 'artist', 'album', 'current', 'candidates')
 DEFAULT_QUEUE_COLUMN_WIDTHS = {
-    'status': 104,
-    'artist': 220,
-    'album': 360,
-    'current': 128,
-    'candidates': 68,
+    'status': 96,
+    'artist': 200,
+    'album': 340,
+    'current': 116,
+    'candidates': 48,
 }
 QUEUE_COLUMN_MIN_WIDTHS = {
-    'status': 88,
+    'status': 82,
     'artist': 90,
     'album': 110,
-    'current': 104,
-    'candidates': 52,
+    'current': 96,
+    'candidates': 38,
 }
 QUEUE_COLUMN_ALIASES = {
     'size': 'current',
@@ -1961,6 +1961,7 @@ class ImagePanel(QFrame):
         self.image_label = SquareArtworkLabel('No artwork')
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setObjectName('artworkPreview')
+        self.image_label.setProperty('empty', True)
         self.meta_label = QLabel('')
         self.meta_label.setObjectName('mutedLabel')
         self.meta_label.setAlignment(Qt.AlignCenter)
@@ -1979,6 +1980,9 @@ class ImagePanel(QFrame):
         self.image_label.setText(text)
         self.image_label.setPixmap(QPixmap())
         self.image_label.setProperty('sourcePixmap', None)
+        self.image_label.setProperty('empty', True)
+        self.image_label.style().unpolish(self.image_label)
+        self.image_label.style().polish(self.image_label)
         self.meta_label.setText(meta)
         self.setCursor(Qt.ArrowCursor)
         self.setToolTip('')
@@ -1992,6 +1996,9 @@ class ImagePanel(QFrame):
         target = self.image_label.size()
         scaled = pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.image_label.setText('')
+        self.image_label.setProperty('empty', False)
+        self.image_label.style().unpolish(self.image_label)
+        self.image_label.style().polish(self.image_label)
         self.image_label.setPixmap(scaled)
         self.image_label.setProperty('sourcePixmap', pix)
         self.meta_label.setText(meta)
@@ -2757,11 +2764,12 @@ class QtArtworkWindow(QMainWindow):
 
     def _settings_saved(self, settings: object) -> None:
         self.settings = dict(settings or load_settings())
-        self.backup_checkbox.blockSignals(True)
-        try:
-            self.backup_checkbox.setChecked(bool(self.settings.get('backup_before_embedding', False)))
-        finally:
-            self.backup_checkbox.blockSignals(False)
+        if hasattr(self, 'backup_before_embed_action'):
+            self.backup_before_embed_action.blockSignals(True)
+            try:
+                self.backup_before_embed_action.setChecked(bool(self.settings.get('backup_before_embedding', False)))
+            finally:
+                self.backup_before_embed_action.blockSignals(False)
         self.reload_queue(select_first=False)
         self.statusBar().showMessage('Settings saved.')
 
@@ -2828,6 +2836,7 @@ class QtArtworkWindow(QMainWindow):
         self.table.setWordWrap(False)
         self.table.setShowGrid(False)
         self.table.setCornerButtonEnabled(False)
+        self.table.viewport().installEventFilter(self)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(31)
         header = self.table.horizontalHeader()
@@ -2850,12 +2859,26 @@ class QtArtworkWindow(QMainWindow):
         layout.setContentsMargins(12, 4, 0, 0)
         layout.setSpacing(12)
 
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        title_stack = QVBoxLayout()
+        title_stack.setContentsMargins(0, 0, 0, 0)
+        title_stack.setSpacing(4)
         self.album_title = ElidedLabel('No album selected')
         self.album_title.setObjectName('albumTitle')
         self.album_subtitle = ElidedLabel('')
         self.album_subtitle.setObjectName('mutedLabel')
-        layout.addWidget(self.album_title)
-        layout.addWidget(self.album_subtitle)
+        title_stack.addWidget(self.album_title)
+        title_stack.addWidget(self.album_subtitle)
+        header.addLayout(title_stack, 1)
+
+        self.more_btn = QPushButton('Album Tools')
+        self.more_btn.setObjectName('quietButton')
+        self.more_btn.setIcon(_line_icon('more'))
+        self.more_btn.setIconSize(QSize(16, 16))
+        self.more_btn.setToolTip('Album tools, maintenance, and less-common actions')
+        header.addWidget(self.more_btn, 0, Qt.AlignTop)
+        layout.addLayout(header)
 
         image_grid = QGridLayout()
         image_grid.setSpacing(12)
@@ -2899,20 +2922,19 @@ class QtArtworkWindow(QMainWindow):
         self.approval_progress.setFixedHeight(8)
         layout.addWidget(self.approval_progress)
 
-        options = QHBoxLayout()
-        options.addStretch(1)
-        self.import_btn = QPushButton('Import Image')
-        self.import_btn.setObjectName('quietButton')
-        self.import_btn.setIcon(_line_icon('folder'))
-        self.import_btn.setIconSize(QSize(16, 16))
-        self.import_btn.clicked.connect(self.import_image_for_current_album)
         self.more_menu = QMenu(self)
+        self.import_action = QAction(_line_icon('folder'), 'Import Image...', self)
+        self.import_action.triggered.connect(self.import_image_for_current_album)
         self.google_action = QAction(_line_icon('search'), 'Open Google Images', self)
         self.google_action.triggered.connect(self.open_google_images_for_current_album)
         self.choose_release_action = QAction(_line_icon('search'), 'Choose Release', self)
         self.choose_release_action.triggered.connect(self.choose_release_for_current_album)
         self.search_more_action = QAction(_line_icon('search'), 'Search More Artwork', self)
         self.search_more_action.triggered.connect(self.search_more_for_current_album)
+        self.open_folder_action = QAction(_line_icon('folder'), 'Open Album Folder', self)
+        self.open_folder_action.triggered.connect(self.open_album_folder)
+        self.open_source_action = QAction(_line_icon('link'), 'Open Source Page', self)
+        self.open_source_action.triggered.connect(self.open_source_page)
         self.refresh_album_action = QAction(_line_icon('refresh'), 'Refresh From Disk', self)
         self.refresh_album_action.triggered.connect(self.refresh_current_album_from_disk)
         self.locate_folder_action = QAction(_line_icon('folder'), 'Locate Album Folder...', self)
@@ -2927,6 +2949,11 @@ class QtArtworkWindow(QMainWindow):
         self.repair_stale_action.triggered.connect(self.repair_stale_candidate_rows)
         self.repair_queue_action = QAction(_line_icon('refresh'), 'Repair Queue States', self)
         self.repair_queue_action.triggered.connect(self.repair_queue_states)
+        self.backup_before_embed_action = QAction('Backup Before Embed', self)
+        self.backup_before_embed_action.setCheckable(True)
+        self.backup_before_embed_action.setChecked(bool(self.settings.get('backup_before_embedding', False)))
+        self.backup_before_embed_action.setToolTip('Save music-file backups before embedding')
+        self.backup_before_embed_action.toggled.connect(self._save_backup_preference)
         self.convert_save_action = QAction(_line_icon('refresh'), 'Convert/Save Current Artwork', self)
         self.convert_save_action.triggered.connect(self.convert_save_current_artwork)
         self.convert_save_next_action = QAction(_line_icon('refresh'), 'Convert/Save Next', self)
@@ -2939,51 +2966,36 @@ class QtArtworkWindow(QMainWindow):
         self.ignore_action.triggered.connect(self.ignore_current_album)
         self.rework_action = QAction(_line_icon('refresh'), 'Rework Album', self)
         self.rework_action.triggered.connect(self.rework_current_album)
-        self.more_menu.addAction(self.google_action)
+
+        self.more_menu.addSection('Artwork')
+        self.more_menu.addAction(self.import_action)
         self.more_menu.addAction(self.choose_release_action)
         self.more_menu.addAction(self.search_more_action)
+        self.more_menu.addAction(self.google_action)
+
+        self.more_menu.addSection('Album')
         self.more_menu.addAction(self.refresh_album_action)
         self.more_menu.addAction(self.locate_folder_action)
         self.more_menu.addAction(self.problem_files_action)
-        self.more_menu.addAction(self.backup_restore_action)
-        self.more_menu.addAction(self.export_diagnostics_action)
-        self.more_menu.addAction(self.repair_stale_action)
-        self.more_menu.addAction(self.repair_queue_action)
-        self.more_menu.addAction(self.convert_save_action)
-        self.more_menu.addAction(self.convert_save_next_action)
-        self.more_menu.addAction(self.reject_all_action)
-        self.more_menu.addSeparator()
+        self.more_menu.addAction(self.open_folder_action)
+        self.more_menu.addAction(self.open_source_action)
+
+        self.more_menu.addSection('Decision')
         self.more_menu.addAction(self.mark_good_action)
         self.more_menu.addAction(self.ignore_action)
-        self.more_menu.addSeparator()
         self.more_menu.addAction(self.rework_action)
-        self.more_btn = QPushButton('More')
-        self.more_btn.setObjectName('quietButton')
-        self.more_btn.setIcon(_line_icon('more'))
-        self.more_btn.setIconSize(QSize(16, 16))
+        self.more_menu.addAction(self.reject_all_action)
+        self.more_menu.addAction(self.convert_save_action)
+        self.more_menu.addAction(self.convert_save_next_action)
+
+        maintenance_menu = self.more_menu.addMenu(_line_icon('scan'), 'Maintenance')
+        maintenance_menu.addAction(self.backup_before_embed_action)
+        maintenance_menu.addAction(self.backup_restore_action)
+        maintenance_menu.addAction(self.export_diagnostics_action)
+        maintenance_menu.addSeparator()
+        maintenance_menu.addAction(self.repair_stale_action)
+        maintenance_menu.addAction(self.repair_queue_action)
         self.more_btn.setMenu(self.more_menu)
-        self.more_btn.setToolTip('More album actions')
-        self.open_folder_btn = QPushButton('Open Album Folder')
-        self.open_folder_btn.setObjectName('quietButton')
-        self.open_folder_btn.setIcon(_line_icon('folder'))
-        self.open_folder_btn.setIconSize(QSize(16, 16))
-        self.open_folder_btn.clicked.connect(self.open_album_folder)
-        self.open_source_btn = QPushButton('Open Source Page')
-        self.open_source_btn.setObjectName('quietButton')
-        self.open_source_btn.setIcon(_line_icon('link'))
-        self.open_source_btn.setIconSize(QSize(16, 16))
-        self.open_source_btn.clicked.connect(self.open_source_page)
-        options.addWidget(self.import_btn)
-        options.addWidget(self.more_btn)
-        options.addWidget(self.open_folder_btn)
-        options.addWidget(self.open_source_btn)
-        self.backup_checkbox = QCheckBox('Backup before embed')
-        self.backup_checkbox.setObjectName('inlineOption')
-        self.backup_checkbox.setChecked(bool(self.settings.get('backup_before_embedding', False)))
-        self.backup_checkbox.setToolTip('Save music-file backups before embedding')
-        self.backup_checkbox.toggled.connect(self._save_backup_preference)
-        options.addWidget(self.backup_checkbox)
-        layout.addLayout(options)
 
         actions = QHBoxLayout()
         self.find_btn = QPushButton('Find Artwork')
@@ -3208,8 +3220,8 @@ class QtArtworkWindow(QMainWindow):
         self.candidate_panel.set_placeholder('No artwork')
         self.details.setPlainText('')
         self.details.setPlaceholderText('Select an album to review.')
-        self.open_folder_btn.setEnabled(False)
-        self.open_source_btn.setEnabled(False)
+        self.open_folder_action.setEnabled(False)
+        self.open_source_action.setEnabled(False)
         busy = any([
             self.search_worker is not None and self.search_worker.isRunning(),
             self.approval_worker is not None and self.approval_worker.isRunning(),
@@ -3329,10 +3341,10 @@ class QtArtworkWindow(QMainWindow):
         minimums = dict(QUEUE_COLUMN_MIN_WIDTHS)
         available = max(sum(minimums.values()), available)
         if available < 680:
-            status_w, current_w, candidates_w = 88, 116, 52
+            status_w, current_w, candidates_w = 82, 104, 38
             artist_min, album_min, artist_cap = 90, 110, 160
         else:
-            status_w, current_w, candidates_w = 104, 128, 68
+            status_w, current_w, candidates_w = 96, 116, 48
             artist_min, album_min, artist_cap = 140, 220, 260
         remaining = max(
             artist_min + album_min,
@@ -3348,8 +3360,29 @@ class QtArtworkWindow(QMainWindow):
             'candidates': candidates_w,
         }
 
+    def _fit_queue_column_widths(self, widths: Dict[str, int]) -> Dict[str, int]:
+        available = max(0, int(self.table.viewport().width()) - 2)
+        if available <= 80:
+            return dict(widths)
+        fitted = {
+            name: max(QUEUE_COLUMN_MIN_WIDTHS.get(name, 40), int(widths.get(name, DEFAULT_QUEUE_COLUMN_WIDTHS.get(name, 100))))
+            for name in QUEUE_COLUMNS
+        }
+        excess = sum(fitted.values()) - available
+        if excess <= 0:
+            return fitted
+        for name in ('album', 'artist', 'current', 'status', 'candidates'):
+            minimum = QUEUE_COLUMN_MIN_WIDTHS.get(name, 40)
+            reducible = max(0, fitted.get(name, minimum) - minimum)
+            take = min(excess, reducible)
+            fitted[name] -= take
+            excess -= take
+            if excess <= 0:
+                break
+        return fitted
+
     def _apply_queue_column_widths(self) -> None:
-        widths = self._queue_column_widths_from_settings()
+        widths = self._fit_queue_column_widths(self._queue_column_widths_from_settings())
         self._restoring_queue_columns = True
         try:
             for col, name in enumerate(QUEUE_COLUMNS):
@@ -3461,8 +3494,8 @@ class QtArtworkWindow(QMainWindow):
         album_name = _text(album.get('album'), 'Unknown Album')
         self.album_title.setText(f'{artist} - {album_name}')
         self.album_subtitle.setText(_path_tail(_text(album.get('album_path')), parts=4))
-        self.open_folder_btn.setEnabled(bool(_text(album.get('album_path'))))
-        self.open_source_btn.setEnabled(False)
+        self.open_folder_action.setEnabled(bool(_text(album.get('album_path'))))
+        self.open_source_action.setEnabled(False)
         self.current_panel.set_placeholder('Loading...', 'Reading embedded artwork')
         self._load_current_art(album)
         self._load_candidates(album)
@@ -3563,7 +3596,7 @@ class QtArtworkWindow(QMainWindow):
         self._refresh_candidate_option_selection(row)
         if row < 0 or row >= len(self.current_candidates):
             self.candidate_panel.set_placeholder('No saved candidate')
-            self.open_source_btn.setEnabled(False)
+            self.open_source_action.setEnabled(False)
             self._render_details()
             return
         cand = self.current_candidates[row]
@@ -3573,7 +3606,7 @@ class QtArtworkWindow(QMainWindow):
         if cand.get('score') is not None:
             meta = (meta + ' - ' if meta else '') + f"{int(cand.get('score') or 0)}/100"
         self.candidate_panel.set_image(cand.get('image_path'), meta)
-        self.open_source_btn.setEnabled(bool(_text(cand.get('source_url'))))
+        self.open_source_action.setEnabled(bool(_text(cand.get('source_url'))))
         self._render_details(cand)
         self._refresh_action_states()
 
@@ -3674,13 +3707,23 @@ class QtArtworkWindow(QMainWindow):
                 lines.extend(recent)
         self.details.setPlainText('\n'.join(lines))
 
-    def _save_backup_preference(self) -> None:
+    def _save_backup_preference(self, checked: Optional[bool] = None) -> None:
         try:
-            value = bool(self.backup_checkbox.isChecked())
+            if checked is None:
+                value = bool(self.settings.get('backup_before_embedding', False))
+                if hasattr(self, 'backup_before_embed_action'):
+                    value = bool(self.backup_before_embed_action.isChecked())
+            else:
+                value = bool(checked)
             self.settings['backup_before_embedding'] = value
             save_settings({'backup_before_embedding': value})
         except Exception:
             pass
+
+    def _backup_before_embed(self) -> bool:
+        if hasattr(self, 'backup_before_embed_action'):
+            return bool(self.backup_before_embed_action.isChecked())
+        return bool(self.settings.get('backup_before_embedding', False))
 
     def _refresh_action_states(self) -> None:
         has_candidate = self._selected_candidate() is not None
@@ -3708,14 +3751,15 @@ class QtArtworkWindow(QMainWindow):
         can_use_active_album = bool(has_album_key and bucket not in {'Good', 'Handled'} and not busy)
         can_rework = bool(has_album_key and bucket in {'Good', 'Handled'} and not busy)
         self.find_btn.setEnabled(can_search and not busy)
+        self.search_next_btn.setVisible(bool(can_search_next and not search_busy))
         self.search_next_btn.setEnabled(can_search_next and not busy)
         self.stop_search_btn.setVisible(search_busy)
         self.stop_search_btn.setEnabled(search_busy)
         self.approve_btn.setEnabled(has_candidate and not busy)
         self.reject_btn.setEnabled(has_candidate and not busy)
         self.skip_btn.setEnabled(can_use_active_album)
-        self.backup_checkbox.setEnabled(not busy)
-        self.import_btn.setEnabled(can_use_active_album)
+        self.backup_before_embed_action.setEnabled(not busy)
+        self.import_action.setEnabled(can_use_active_album)
         self.more_btn.setEnabled(not busy)
         self.google_action.setEnabled(bool(has_album_key and not busy))
         self.choose_release_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'} and not busy))
@@ -3733,11 +3777,15 @@ class QtArtworkWindow(QMainWindow):
         self.mark_good_action.setEnabled(can_use_active_album)
         self.ignore_action.setEnabled(can_use_active_album)
         self.rework_action.setEnabled(can_rework)
-        self.open_folder_btn.setEnabled(bool(self.current_album and _text(self.current_album.get('album_path'))))
-        self.open_source_btn.setEnabled(bool(has_candidate and _text((self._selected_candidate() or {}).get('source_url'))))
+        self.open_folder_action.setEnabled(bool(self.current_album and _text(self.current_album.get('album_path'))))
+        self.open_source_action.setEnabled(bool(has_candidate and _text((self._selected_candidate() or {}).get('source_url'))))
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt naming
         try:
+            if hasattr(self, 'table') and watched is self.table.viewport() and event.type() == QEvent.Type.Resize:
+                if not self._restoring_queue_columns:
+                    QTimer.singleShot(0, self._apply_queue_column_widths)
+                return super().eventFilter(watched, event)
             if event.type() == QEvent.Type.KeyPress and self.isActiveWindow():
                 key = event.key()
                 modifiers = event.modifiers()
@@ -4837,8 +4885,7 @@ class QtArtworkWindow(QMainWindow):
             pass
         self.last_convert_result = None
         label = self._album_display_name(album)
-        backup = bool(self.backup_checkbox.isChecked())
-        self._save_backup_preference()
+        backup = self._backup_before_embed()
         self.approval_status.setText(f'Preparing Convert/Save: {label}...')
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
@@ -4885,8 +4932,7 @@ class QtArtworkWindow(QMainWindow):
             self.statusBar().showMessage('Convert/Save Next cancelled.')
             return
         self.last_convert_result = None
-        backup = bool(self.backup_checkbox.isChecked())
-        self._save_backup_preference()
+        backup = self._backup_before_embed()
         self.pending_approval_row = max(0, self.table.currentRow())
         self.approval_status.setText(f'Convert/Save Next starting: {len(albums)} album(s)...')
         self.approval_progress.setVisible(True)
@@ -5009,8 +5055,7 @@ class QtArtworkWindow(QMainWindow):
                 return
 
         self.last_approval_result = None
-        backup = bool(self.backup_checkbox.isChecked())
-        self._save_backup_preference()
+        backup = self._backup_before_embed()
         self.approval_status.setText('Preparing embed...')
         self.approval_progress.setVisible(True)
         self.approval_progress.setRange(0, 0)
@@ -5286,6 +5331,11 @@ class QtArtworkWindow(QMainWindow):
                 border-radius: 4px;
                 color: #777b84;
             }
+            QLabel#artworkPreview[empty="true"] {
+                background: #fbfbfd;
+                border: 1px dashed #dfe3eb;
+                color: #858b96;
+            }
             QDialog#artworkPreviewDialog {
                 background: #f5f5f7;
             }
@@ -5354,6 +5404,12 @@ class QtArtworkWindow(QMainWindow):
             }
             QMenu::item:disabled {
                 color: #a0a4ad;
+            }
+            QMenu::section {
+                color: #6b7280;
+                font-size: 11px;
+                font-weight: 700;
+                padding: 8px 24px 3px 24px;
             }
             QMenu::separator {
                 height: 1px;
