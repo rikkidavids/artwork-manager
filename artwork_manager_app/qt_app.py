@@ -1,12 +1,11 @@
 """PySide6 UI for artwork review.
 
-This view reuses the existing database, state, and media helpers while the
-established Tk window still owns scan, settings, and bulk maintenance tools.
+This view reuses the existing database, state, scanner, provider, and media
+helpers while the migration from the established Tk window continues.
 """
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import threading
 import webbrowser
@@ -18,8 +17,14 @@ from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QPainter, QPen,
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -30,9 +35,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -43,9 +51,23 @@ from PySide6.QtWidgets import (
 
 from .approval import ApprovalBlocked, approve_candidate, candidate_needs_warning, candidate_warning_text
 from . import database as db
-from .config import APP_DIR, BUILD_VERSION, get_max_candidates_per_album, load_settings, save_settings
+from .config import (
+    APP_DIR,
+    BUILD_VERSION,
+    get_batch_search_count,
+    get_deep_scan_all_files,
+    get_fetch_min_artwork_size,
+    get_max_candidates_per_album,
+    get_nas_worker_timeout,
+    get_preferred_artwork_size,
+    get_scan_min_artwork_size,
+    get_scan_worker_threads,
+    get_target_size_match_mode,
+    load_settings,
+    save_settings,
+)
 from .review_queue import build_candidates
-from .scanner import embedded_artwork
+from .scanner import embedded_artwork, scan_library, write_low_res_csv
 from .state import evaluate_album_record, workflow_bucket_for_status
 from .utils import open_path
 
@@ -66,6 +88,13 @@ FILTER_TOOLTIPS = {
     'Done': 'Albums already marked good, approved, handled, or skipped.',
     'All': 'Show every album record.',
 }
+PROVIDER_OPTIONS = (
+    ('deezer_enabled', 'Deezer'),
+    ('itunes_enabled', 'Apple / iTunes'),
+    ('musicbrainz_enabled', 'MusicBrainz / Cover Art Archive'),
+    ('discogs_enabled', 'Discogs'),
+    ('fanarttv_enabled', 'fanart.tv'),
+)
 QUEUE_COLUMNS = ('status', 'artist', 'album', 'current', 'candidates')
 DEFAULT_QUEUE_COLUMN_WIDTHS = {
     'status': 104,
@@ -173,6 +202,25 @@ def _line_icon(kind: str, color: str = '#4b5563') -> QIcon:
         painter.drawRoundedRect(QRectF(3.5, 4.5, 13, 10), 2, 2)
         painter.drawLine(8, 16, 12, 16)
         painter.drawLine(10, 14.5, 10, 16)
+    elif kind == 'scan':
+        painter.drawLine(3.5, 7, 7.5, 7)
+        painter.drawLine(7.5, 7, 9.5, 9)
+        painter.drawLine(9.5, 9, 16.5, 9)
+        painter.drawLine(16.5, 9, 16.5, 15)
+        painter.drawLine(16.5, 15, 3.5, 15)
+        painter.drawLine(3.5, 15, 3.5, 7)
+        painter.drawEllipse(QRectF(9, 3.5, 5.5, 5.5))
+        painter.drawLine(13.5, 8, 17, 11.5)
+    elif kind == 'settings':
+        painter.drawEllipse(QRectF(7, 7, 6, 6))
+        painter.drawLine(10, 3, 10, 5.5)
+        painter.drawLine(10, 14.5, 10, 17)
+        painter.drawLine(3, 10, 5.5, 10)
+        painter.drawLine(14.5, 10, 17, 10)
+        painter.drawLine(5, 5, 6.8, 6.8)
+        painter.drawLine(13.2, 13.2, 15, 15)
+        painter.drawLine(15, 5, 13.2, 6.8)
+        painter.drawLine(6.8, 13.2, 5, 15)
     elif kind == 'search':
         painter.drawEllipse(QRectF(4, 4, 8.5, 8.5))
         painter.drawLine(11, 11, 16, 16)
@@ -320,6 +368,393 @@ class SearchWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class LibraryScanWorker(QThread):
+    progress = Signal(int, int, str)
+    album_queued = Signal(object)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, library_root: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.library_root = library_root
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def run(self) -> None:
+        rows = []
+        try:
+            db.start_scan(self.library_root, 0)
+
+            def progress(done: int, total: int, path: str) -> None:
+                self.progress.emit(int(done or 0), int(total or 0), str(path or ''))
+
+            def on_album(row: object, info: Dict[str, Any], _count: int) -> None:
+                rows.append(row)
+                self.album_queued.emit({
+                    'artist': _text(info.get('artist'), 'Unknown Artist'),
+                    'album': _text(info.get('album'), 'Unknown Album'),
+                    'album_key': info.get('album_key'),
+                })
+
+            scan_library(
+                self.library_root,
+                include_missing=True,
+                progress=progress,
+                stop_event=self.stop_event,
+                on_album=on_album,
+                total_albums=0,
+                resume=True,
+            )
+            stopped = self.stop_event.is_set()
+            db.finish_scan(stopped=stopped)
+            csv_path = write_low_res_csv(rows) if rows else ''
+            self.completed.emit({'stopped': stopped, 'queued': len(rows), 'csv': csv_path})
+        except Exception as exc:
+            try:
+                db.finish_scan(stopped=self.stop_event.is_set())
+            except Exception:
+                pass
+            self.failed.emit(str(exc))
+
+
+class SettingsDialog(QDialog):
+    settings_saved = Signal(object)
+
+    def __init__(self, settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.settings = dict(settings or {})
+        self.provider_checks: Dict[str, QCheckBox] = {}
+        self.spinboxes: Dict[str, QSpinBox] = {}
+        self.checkboxes: Dict[str, QCheckBox] = {}
+        self.edits: Dict[str, QLineEdit] = {}
+        self.target_mode = QComboBox()
+
+        self.setWindowTitle('Settings')
+        self.resize(680, 620)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._scroll_tab(self._build_artwork_tab()), 'Artwork')
+        tabs.addTab(self._scroll_tab(self._build_providers_tab()), 'Providers')
+        tabs.addTab(self._scroll_tab(self._build_nas_tab()), 'NAS Worker')
+        layout.addWidget(tabs, 1)
+
+        buttons = QDialogButtonBox()
+        save_btn = buttons.addButton('Save Settings', QDialogButtonBox.AcceptRole)
+        save_btn.setObjectName('primaryButton')
+        buttons.addButton(QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _scroll_tab(self, body: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(body)
+        return scroll
+
+    def _spin(self, key: str, value: int, minimum: int, maximum: int, suffix: str = '') -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setValue(int(value or minimum))
+        if suffix:
+            spin.setSuffix(suffix)
+        self.spinboxes[key] = spin
+        return spin
+
+    def _check(self, key: str, label: str, default: bool = False) -> QCheckBox:
+        check = QCheckBox(label)
+        check.setChecked(bool(self.settings.get(key, default)))
+        self.checkboxes[key] = check
+        return check
+
+    def _edit(self, key: str, placeholder: str = '', password: bool = False) -> QLineEdit:
+        edit = QLineEdit(_text(self.settings.get(key)))
+        edit.setPlaceholderText(placeholder)
+        if password:
+            edit.setEchoMode(QLineEdit.Password)
+        self.edits[key] = edit
+        return edit
+
+    def _build_artwork_tab(self) -> QWidget:
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(2, 2, 8, 2)
+        layout.setSpacing(12)
+
+        scan_group = QGroupBox('Artwork Rules')
+        form = QFormLayout(scan_group)
+        form.setLabelAlignment(Qt.AlignRight)
+        form.addRow('Queue if embedded artwork is below', self._spin('scan_min_artwork_size', get_scan_min_artwork_size(self.settings), 1, 10000, ' px'))
+        form.addRow('Only save fetched artwork at least', self._spin('fetch_min_artwork_size', get_fetch_min_artwork_size(self.settings), 1, 10000, ' px'))
+        form.addRow('Preferred target size', self._spin('preferred_artwork_size', get_preferred_artwork_size(self.settings), 1, 10000, ' px'))
+        self.target_mode.addItems(['Relaxed', 'Strict'])
+        self.target_mode.setCurrentText(get_target_size_match_mode(self.settings))
+        form.addRow('Target matching', self.target_mode)
+        layout.addWidget(scan_group)
+
+        scan_options = QGroupBox('Scanning')
+        scan_layout = QVBoxLayout(scan_options)
+        scan_layout.addWidget(self._check('deep_scan_all_files', 'Deep check every music file during scan', get_deep_scan_all_files(self.settings)))
+        scan_form = QFormLayout()
+        scan_form.addRow('Album folders checked at once', self._spin('scan_worker_threads', get_scan_worker_threads(self.settings), 1, 32))
+        scan_layout.addLayout(scan_form)
+        hint = QLabel('For NAS libraries, 4-12 workers is usually the useful range.')
+        hint.setObjectName('mutedLabel')
+        scan_layout.addWidget(hint)
+        layout.addWidget(scan_options)
+
+        review_group = QGroupBox('Review + Approval')
+        review_form = QFormLayout(review_group)
+        review_form.addRow('Options saved per album', self._spin('max_candidates_per_album', get_max_candidates_per_album(self.settings), 1, 25))
+        review_form.addRow('Batch search count', self._spin('batch_search_count', get_batch_search_count(self.settings), 1, 50))
+        review_form.addRow('', self._check('save_approved_artwork_to_album_folder', 'Save approved artwork into the album folder', False))
+        review_form.addRow('', self._check('warn_before_low_confidence_embed', 'Warn before lower-confidence embeds', True))
+        review_form.addRow('', self._check('resize_approved_artwork', 'Convert approved artwork to target-size JPEG', True))
+        review_form.addRow('', self._check('verify_after_embed_before_good', 'Verify all files before marking Good', True))
+        review_form.addRow('', self._check('backup_before_embedding', 'Backup before embed by default', False))
+        layout.addWidget(review_group)
+        layout.addStretch(1)
+        return body
+
+    def _build_providers_tab(self) -> QWidget:
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(2, 2, 8, 2)
+        layout.setSpacing(12)
+
+        group = QGroupBox('Artwork Providers')
+        group_layout = QVBoxLayout(group)
+        for key, label in PROVIDER_OPTIONS:
+            check = QCheckBox(label)
+            check.setChecked(bool(self.settings.get(key, True if key != 'fanarttv_enabled' else False)))
+            self.provider_checks[key] = check
+            group_layout.addWidget(check)
+        layout.addWidget(group)
+
+        discogs = QGroupBox('Discogs')
+        discogs_form = QFormLayout(discogs)
+        discogs_form.addRow('Token', self._edit('discogs_token', 'Optional fallback search token', password=True))
+        hint = QLabel('Provider order is preserved from your existing settings; this dialog keeps the common on/off controls simple.')
+        hint.setObjectName('mutedLabel')
+        hint.setWordWrap(True)
+        discogs_form.addRow('', hint)
+        layout.addWidget(discogs)
+        layout.addStretch(1)
+        return body
+
+    def _build_nas_tab(self) -> QWidget:
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(2, 2, 8, 2)
+        layout.setSpacing(12)
+
+        group = QGroupBox('NAS Worker')
+        group_layout = QVBoxLayout(group)
+        group_layout.addWidget(self._check('nas_worker_enabled', 'Use NAS worker when path mapping matches', False))
+        form = QFormLayout()
+        form.addRow('Worker URL', self._edit('nas_worker_url', 'http://nas.local:8765'))
+        form.addRow('API token', self._edit('nas_worker_token', '', password=True))
+        form.addRow('Mac path prefix', self._edit('nas_worker_local_prefix', '/Volumes/Music'))
+        form.addRow('Worker path prefix', self._edit('nas_worker_remote_prefix', '/music'))
+        form.addRow('Timeout', self._spin('nas_worker_timeout', get_nas_worker_timeout(self.settings), 5, 7200, ' sec'))
+        group_layout.addLayout(form)
+        hint = QLabel('Example mapping: /Volumes/Music on the Mac maps to /music inside the worker container.')
+        hint.setObjectName('mutedLabel')
+        hint.setWordWrap(True)
+        group_layout.addWidget(hint)
+        layout.addWidget(group)
+        layout.addStretch(1)
+        return body
+
+    def _current_settings(self) -> Dict[str, Any]:
+        settings = {
+            'provider_order': self.settings.get('provider_order') or ['deezer', 'itunes', 'musicbrainz', 'discogs', 'fanarttv'],
+            'target_size_match_mode': self.target_mode.currentText() if self.target_mode.currentText() in {'Relaxed', 'Strict'} else 'Relaxed',
+        }
+        for key, check in self.provider_checks.items():
+            settings[key] = check.isChecked()
+        for key, spin in self.spinboxes.items():
+            settings[key] = int(spin.value())
+        for key, check in self.checkboxes.items():
+            settings[key] = check.isChecked()
+        for key, edit in self.edits.items():
+            text = edit.text().strip()
+            if key == 'nas_worker_remote_prefix' and not text:
+                text = '/music'
+            settings[key] = text
+        return settings
+
+    def save(self) -> None:
+        try:
+            save_settings(self._current_settings())
+            self.settings = load_settings()
+            self.settings_saved.emit(self.settings)
+            self.accept()
+        except Exception as exc:
+            QMessageBox.warning(self, 'Settings not saved', str(exc))
+
+
+class ScanDialog(QDialog):
+    scan_finished = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.settings = load_settings()
+        self.worker: Optional[LibraryScanWorker] = None
+        self.queued_count = 0
+
+        self.setWindowTitle('Scan Library')
+        self.resize(620, 260)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        title = QLabel('Scan Library')
+        title.setObjectName('sectionTitle')
+        layout.addWidget(title)
+
+        hint = QLabel('Choose your music folder. The scan runs in the background and saves albums that need artwork into the queue.')
+        hint.setObjectName('mutedLabel')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        path_row = QHBoxLayout()
+        self.path_edit = QLineEdit(_text(self.settings.get('last_library_path')))
+        self.path_edit.setPlaceholderText('Choose music library folder...')
+        path_row.addWidget(self.path_edit, 1)
+        browse = QPushButton('Choose')
+        browse.setObjectName('quietButton')
+        browse.clicked.connect(self.choose_folder)
+        path_row.addWidget(browse)
+        layout.addLayout(path_row)
+
+        self.status_label = QLabel('Ready to scan.')
+        self.status_label.setObjectName('mutedLabel')
+        layout.addWidget(self.status_label)
+
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(8)
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        layout.addWidget(self.progress)
+
+        actions = QHBoxLayout()
+        self.start_btn = QPushButton('Start Scan')
+        self.start_btn.setObjectName('primaryButton')
+        self.start_btn.setIcon(_line_icon('scan', '#ffffff'))
+        self.start_btn.clicked.connect(self.start_scan)
+        actions.addWidget(self.start_btn)
+
+        self.stop_btn = QPushButton('Stop')
+        self.stop_btn.setObjectName('dangerButton')
+        self.stop_btn.setIcon(_line_icon('stop', '#ffffff'))
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_scan)
+        actions.addWidget(self.stop_btn)
+        actions.addStretch(1)
+
+        close = QPushButton('Close')
+        close.setObjectName('quietButton')
+        close.clicked.connect(self.close)
+        actions.addWidget(close)
+        layout.addLayout(actions)
+
+    def choose_folder(self) -> None:
+        start = self.path_edit.text().strip() or str(Path.home())
+        folder = QFileDialog.getExistingDirectory(self, 'Choose Music Library', start)
+        if folder:
+            self.path_edit.setText(folder)
+
+    def start_scan(self) -> None:
+        folder = self.path_edit.text().strip()
+        if not folder or not os.path.isdir(folder):
+            QMessageBox.warning(self, 'Folder not found', 'Choose a valid music folder first.')
+            return
+        if self.worker is not None and self.worker.isRunning():
+            return
+        save_settings({'last_library_path': folder})
+        self.settings = load_settings()
+        self.queued_count = 0
+        self.status_label.setText('Scanning library...')
+        self.progress.setRange(0, 0)
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+        worker = LibraryScanWorker(folder, self)
+        worker.progress.connect(self._scan_progress)
+        worker.album_queued.connect(self._album_queued)
+        worker.completed.connect(self._scan_completed)
+        worker.failed.connect(self._scan_failed)
+        worker.finished.connect(lambda w=worker: self._scan_worker_finished(w))
+        self.worker = worker
+        worker.start()
+
+    def stop_scan(self) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.stop()
+            self.stop_btn.setEnabled(False)
+            self.status_label.setText('Stopping after the current album finishes...')
+
+    def _scan_progress(self, done: int, total: int, path: str) -> None:
+        if total > 0:
+            self.progress.setRange(0, total)
+            self.progress.setValue(max(0, min(done, total)))
+            self.status_label.setText(f'Checked {done:,} of {total:,} albums - {_path_tail(path, parts=3)}')
+        else:
+            self.progress.setRange(0, 0)
+            self.status_label.setText(f'Checked {done:,} album folders - {_path_tail(path, parts=3)}')
+
+    def _album_queued(self, info: object) -> None:
+        self.queued_count += 1
+        info = dict(info or {})
+        self.status_label.setText(f'Queued {self.queued_count:,}: {_text(info.get("artist"))} - {_text(info.get("album"))}')
+
+    def _scan_completed(self, result: object) -> None:
+        result = dict(result or {})
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        queued = int(result.get('queued') or 0)
+        if result.get('stopped'):
+            message = f'Scan stopped. {queued:,} album(s) queued.'
+        else:
+            message = f'Scan complete. {queued:,} album(s) queued.'
+        csv_path = _text(result.get('csv'))
+        if csv_path:
+            message += f' Report saved: {_path_tail(csv_path, parts=2)}'
+        self.status_label.setText(message)
+        self.scan_finished.emit()
+
+    def _scan_failed(self, message: str) -> None:
+        self.progress.setRange(0, 1)
+        self.progress.setValue(0)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText('Scan failed.')
+        QMessageBox.warning(self, 'Scan failed', message)
+        self.scan_finished.emit()
+
+    def _scan_worker_finished(self, worker: LibraryScanWorker) -> None:
+        if self.worker is worker:
+            self.worker = None
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, 'Scan still running', 'Stop the scan before closing this window.')
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 class SquareArtworkLabel(QLabel):
     def __init__(self, text: str = ''):
         super().__init__(text)
@@ -453,6 +888,7 @@ class QtArtworkWindow(QMainWindow):
         self.current_art_workers: List[CurrentArtWorker] = []
         self.approval_worker: Optional[ApprovalWorker] = None
         self.search_worker: Optional[SearchWorker] = None
+        self.scan_dialog: Optional[ScanDialog] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
         self.last_search_log: List[str] = []
         self.last_search_album_key = ''
@@ -494,10 +930,15 @@ class QtArtworkWindow(QMainWindow):
         refresh.triggered.connect(lambda: self.reload_queue(select_first=False))
         toolbar.addAction(refresh)
 
-        open_tk = QAction(_line_icon('app'), 'Scan + Settings', self)
-        open_tk.setToolTip('Open scan, settings, and maintenance tools')
-        open_tk.triggered.connect(self._open_scan_tools)
-        toolbar.addAction(open_tk)
+        scan = QAction(_line_icon('scan'), 'Scan Library', self)
+        scan.setToolTip('Scan your music folder and update the review queue')
+        scan.triggered.connect(self.open_scan_dialog)
+        toolbar.addAction(scan)
+
+        settings = QAction(_line_icon('settings'), 'Settings', self)
+        settings.setToolTip('Artwork, provider, approval, and NAS worker settings')
+        settings.triggered.connect(self.open_settings_dialog)
+        toolbar.addAction(settings)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -521,6 +962,36 @@ class QtArtworkWindow(QMainWindow):
 
         self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
+
+    def open_scan_dialog(self) -> None:
+        if self.scan_dialog is not None and self.scan_dialog.isVisible():
+            self.scan_dialog.raise_()
+            self.scan_dialog.activateWindow()
+            return
+        dialog = ScanDialog(self)
+        dialog.scan_finished.connect(lambda: self.reload_queue(select_first=False))
+        dialog.finished.connect(lambda _result=0, dlg=dialog: self._scan_dialog_closed(dlg))
+        self.scan_dialog = dialog
+        dialog.show()
+
+    def _scan_dialog_closed(self, dialog: ScanDialog) -> None:
+        if self.scan_dialog is dialog:
+            self.scan_dialog = None
+
+    def open_settings_dialog(self) -> None:
+        dialog = SettingsDialog(self.settings, self)
+        dialog.settings_saved.connect(self._settings_saved)
+        dialog.exec()
+
+    def _settings_saved(self, settings: object) -> None:
+        self.settings = dict(settings or load_settings())
+        self.backup_checkbox.blockSignals(True)
+        try:
+            self.backup_checkbox.setChecked(bool(self.settings.get('backup_before_embedding', False)))
+        finally:
+            self.backup_checkbox.blockSignals(False)
+        self.reload_queue(select_first=False)
+        self.statusBar().showMessage('Settings saved.')
 
     def _build_queue_panel(self) -> QWidget:
         panel = QFrame()
@@ -1521,22 +1992,13 @@ class QtArtworkWindow(QMainWindow):
             if url:
                 webbrowser.open(url)
 
-    def _open_scan_tools(self) -> None:
-        try:
-            subprocess.Popen(
-                [sys.executable, '-m', 'artwork_manager_app.main'],
-                cwd=str(APP_DIR.parent),
-                start_new_session=True,
-            )
-            self.statusBar().showMessage('Opened Scan + Settings window.')
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                'Could not open Scan + Settings',
-                f'Open the main app with: python -m artwork_manager_app.main\n\n{exc}',
-            )
-
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self.scan_dialog is not None:
+            worker = getattr(self.scan_dialog, 'worker', None)
+            if worker is not None and worker.isRunning():
+                QMessageBox.information(self, 'Scan still running', 'Stop the scan before closing Artwork Manager.')
+                event.ignore()
+                return
         if self.queue_filter_save_timer.isActive():
             self.queue_filter_save_timer.stop()
             self._save_queue_filter_state()
@@ -1625,7 +2087,7 @@ class QtArtworkWindow(QMainWindow):
                 border-radius: 4px;
                 color: #777b84;
             }
-            QLineEdit, QTextEdit, QListWidget, QTableWidget {
+            QLineEdit, QTextEdit, QListWidget, QTableWidget, QComboBox, QSpinBox {
                 background: #ffffff;
                 border: 1px solid #d9d9df;
                 border-radius: 6px;
@@ -1633,11 +2095,57 @@ class QtArtworkWindow(QMainWindow):
                 selection-background-color: #dbeafe;
                 selection-color: #111827;
             }
-            QLineEdit:hover, QTextEdit:hover, QListWidget:hover, QTableWidget:hover {
+            QLineEdit:hover, QTextEdit:hover, QListWidget:hover, QTableWidget:hover, QComboBox:hover, QSpinBox:hover {
                 border-color: #c5c9d3;
             }
-            QLineEdit:focus, QTextEdit:focus, QListWidget:focus, QTableWidget:focus {
+            QLineEdit:focus, QTextEdit:focus, QListWidget:focus, QTableWidget:focus, QComboBox:focus, QSpinBox:focus {
                 border-color: #8aa4d6;
+            }
+            QComboBox::drop-down, QSpinBox::up-button, QSpinBox::down-button {
+                border: 0;
+                width: 22px;
+                background: transparent;
+            }
+            QTabWidget::pane {
+                border: 1px solid #e0e3ea;
+                border-radius: 6px;
+                background: #ffffff;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background: #fbfbfd;
+                border: 1px solid #d7dce6;
+                border-bottom-color: #e0e3ea;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                padding: 7px 12px;
+                margin-right: 4px;
+                color: #485465;
+                font-weight: 600;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                border-color: #d7dce6;
+                border-bottom-color: #ffffff;
+                color: #17345c;
+            }
+            QGroupBox {
+                background: #ffffff;
+                border: 1px solid #e0e3ea;
+                border-radius: 6px;
+                margin-top: 14px;
+                padding: 12px;
+                font-weight: 700;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 5px;
+                left: 8px;
+                color: #1d1d1f;
+            }
+            QGroupBox QLabel, QGroupBox QCheckBox {
+                background: transparent;
             }
             QTableWidget {
                 gridline-color: transparent;
@@ -1739,6 +2247,7 @@ class QtArtworkWindow(QMainWindow):
                 border-color: #d9d9df;
             }
             QCheckBox {
+                background: transparent;
                 spacing: 8px;
                 color: #343a46;
             }
