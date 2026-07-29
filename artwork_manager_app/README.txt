@@ -1,4 +1,4 @@
-Build 4.76 — Qt problem files check
+Build 4.77 — Qt NAS worker checks
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -35,6 +35,7 @@ Build 4.76 — Qt problem files check
 - Added Qt keyboard review flow for R Reject Option and S Skip Album, matching the existing F Find, A Approve, and N next-album shortcuts.
 - Added Qt Show Problem Files in the More menu, using Mac-local or NAS-worker deep checks to list tracks that are missing, undersized, not square, unreadable, or not baseline JPEG.
 - The Qt details pane now shows saved Deep Check summaries and problem-file counts for the selected album.
+- Added Qt NAS Worker Test and Worker Status controls inside Settings, with background checks and concise compatibility/status reporting.
 
 Qt review branch
 

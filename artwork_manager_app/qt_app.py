@@ -68,7 +68,7 @@ from .config import (
     save_settings,
 )
 from .review_queue import build_candidates, google_images_url, manual_import
-from .remote_worker import deep_check_album_remote, worker_enabled_for_path
+from .remote_worker import check_worker, deep_check_album_remote, worker_enabled_for_path, worker_status, worker_update_hint
 from .scanner import (
     _deep_check_album_files,
     analyze_album_folder,
@@ -600,6 +600,26 @@ class AlbumDeepCheckWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class NasWorkerCheckWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, mode: str, settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.mode = mode
+        self.settings = dict(settings or {})
+
+    def run(self) -> None:
+        try:
+            if self.mode == 'status':
+                result = worker_status(self.settings)
+            else:
+                result = check_worker(self.settings)
+            self.completed.emit({'mode': self.mode, 'result': result})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class LibraryScanWorker(QThread):
     progress = Signal(int, int, str)
     album_queued = Signal(object)
@@ -662,6 +682,7 @@ class SettingsDialog(QDialog):
         self.checkboxes: Dict[str, QCheckBox] = {}
         self.edits: Dict[str, QLineEdit] = {}
         self.target_mode = QComboBox()
+        self.nas_check_worker: Optional[NasWorkerCheckWorker] = None
 
         self.setWindowTitle('Settings')
         self.resize(680, 620)
@@ -801,6 +822,23 @@ class SettingsDialog(QDialog):
         hint.setObjectName('mutedLabel')
         hint.setWordWrap(True)
         group_layout.addWidget(hint)
+
+        actions = QHBoxLayout()
+        self.nas_test_btn = QPushButton('Test Worker')
+        self.nas_test_btn.setObjectName('quietButton')
+        self.nas_test_btn.clicked.connect(lambda: self._run_nas_worker_check('test'))
+        self.nas_status_btn = QPushButton('Worker Status')
+        self.nas_status_btn.setObjectName('quietButton')
+        self.nas_status_btn.clicked.connect(lambda: self._run_nas_worker_check('status'))
+        actions.addWidget(self.nas_test_btn)
+        actions.addWidget(self.nas_status_btn)
+        actions.addStretch(1)
+        group_layout.addLayout(actions)
+
+        self.nas_result_label = QLabel('')
+        self.nas_result_label.setObjectName('mutedLabel')
+        self.nas_result_label.setWordWrap(True)
+        group_layout.addWidget(self.nas_result_label)
         layout.addWidget(group)
         layout.addStretch(1)
         return body
@@ -822,6 +860,91 @@ class SettingsDialog(QDialog):
                 text = '/music'
             settings[key] = text
         return settings
+
+    def _set_nas_check_busy(self, busy: bool, text: str = '') -> None:
+        self.nas_test_btn.setEnabled(not busy)
+        self.nas_status_btn.setEnabled(not busy)
+        if text:
+            self.nas_result_label.setText(text)
+
+    def _run_nas_worker_check(self, mode: str) -> None:
+        if self.nas_check_worker is not None and self.nas_check_worker.isRunning():
+            return
+        settings = self._current_settings()
+        label = 'Reading worker status...' if mode == 'status' else 'Testing NAS worker...'
+        self._set_nas_check_busy(True, label)
+        worker = NasWorkerCheckWorker(mode, settings, self)
+        worker.completed.connect(self._nas_worker_check_completed)
+        worker.failed.connect(self._nas_worker_check_failed)
+        worker.finished.connect(lambda w=worker: self._nas_worker_check_finished(w))
+        self.nas_check_worker = worker
+        worker.start()
+
+    def _nas_worker_summary_lines(self, mode: str, result: Dict[str, Any]) -> List[str]:
+        version = _text(result.get('version'), 'unknown')
+        build = _text(result.get('worker_build'), 'unknown')
+        api = _text(result.get('api'), 'unknown')
+        compat = result.get('compatibility') if isinstance(result.get('compatibility'), dict) else {}
+        timing = result.get('_request_duration_seconds')
+        busy = 'busy' if result.get('busy') else 'idle'
+        timing_text = f' - {float(timing):.2f}s' if isinstance(timing, (int, float)) else ''
+        lines = [
+            f'NAS worker {busy}: {version}{timing_text}',
+            f'Build/API: {build} / {api}',
+        ]
+        if not compat.get('ok', True):
+            lines.extend(['', f"Update needed: {compat.get('message') or 'incompatible worker'}", worker_update_hint()])
+        if mode == 'status':
+            uptime = int(result.get('uptime_seconds') or 0)
+            lines.append(f'Uptime: {uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s')
+            recent = result.get('recent_jobs') if isinstance(result.get('recent_jobs'), list) else []
+            active = result.get('active_jobs') if isinstance(result.get('active_jobs'), list) else []
+            if active:
+                lines.extend(['', 'Active jobs:'])
+                for job in active[:5]:
+                    lines.append(f"- {_text(job.get('kind'), 'job')} - {_text(job.get('label'), 'album')}")
+            if recent:
+                lines.extend(['', 'Recent jobs:'])
+                for job in recent[:6]:
+                    ok = 'OK' if job.get('ok') else 'Failed'
+                    duration = job.get('duration_seconds')
+                    duration_text = f'{float(duration):.1f}s' if isinstance(duration, (int, float)) else '?s'
+                    lines.append(f"- {ok} - {_text(job.get('kind'), 'job')} - {duration_text} - {_text(job.get('label'), 'album')}")
+            if not active and not recent:
+                lines.extend(['', 'No worker jobs recorded since the container started.'])
+        else:
+            roots = ', '.join(_text(root) for root in (result.get('music_roots') or []) if _text(root))
+            if roots:
+                lines.append(f'Music roots: {roots}')
+        return lines
+
+    def _nas_worker_check_completed(self, payload: object) -> None:
+        payload = dict(payload or {})
+        mode = _text(payload.get('mode'), 'test')
+        result = payload.get('result') if isinstance(payload.get('result'), dict) else {}
+        lines = self._nas_worker_summary_lines(mode, result)
+        self.nas_result_label.setText(lines[0] if lines else 'NAS worker check complete.')
+        self._set_nas_check_busy(False)
+        title = 'NAS Worker Status' if mode == 'status' else 'NAS Worker OK'
+        QMessageBox.information(self, title, '\n'.join(lines))
+
+    def _nas_worker_check_failed(self, message: str) -> None:
+        message = _text(message, 'NAS worker check failed.')
+        self.nas_result_label.setText(message)
+        self._set_nas_check_busy(False)
+        QMessageBox.warning(self, 'NAS worker check failed', message)
+
+    def _nas_worker_check_finished(self, worker: NasWorkerCheckWorker) -> None:
+        if self.nas_check_worker is worker:
+            self.nas_check_worker = None
+        self._set_nas_check_busy(False)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self.nas_check_worker is not None and self.nas_check_worker.isRunning():
+            QMessageBox.information(self, 'NAS worker check running', 'Wait for the NAS worker check to finish before closing Settings.')
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def save(self) -> None:
         try:
