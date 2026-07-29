@@ -1,6 +1,7 @@
-Build 4.88 — Qt storage cleanup
+Build 4.89 — Qt queue state repair
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
+- Added Qt Repair Queue States to fix stale saved queue labels using existing database metadata without scanning NAS album folders.
 - Added a Qt Settings Storage tab for app-managed cleanup: handled temp artwork, orphan temp artwork, approved copy cache, and app data folder access.
 - Added Qt Locate Album Folder so moved or remounted NAS album paths can be repaired without opening the old app.
 - Added Qt Repair Missing Option Rows to remove saved artwork-option records whose image files no longer exist and reclassify affected albums.
