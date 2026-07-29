@@ -51,7 +51,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .approval import ApprovalBlocked, approve_candidate, candidate_needs_warning, candidate_warning_text
+from .approval import (
+    ApprovalBlocked,
+    approve_candidate,
+    candidate_needs_warning,
+    candidate_warning_text,
+    convert_embedded_artwork,
+)
 from . import database as db
 from .config import (
     APP_DIR,
@@ -460,6 +466,32 @@ class ApprovalWorker(QThread):
             self.failed.emit(str(exc))
         except Exception as exc:
             self.failed.emit(f'Embedding failed: {exc}')
+
+
+class ConvertSaveWorker(QThread):
+    progress = Signal(int, int, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, album: Dict[str, Any], backup: bool, settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.album = dict(album or {})
+        self.backup = bool(backup)
+        self.settings = dict(settings or {})
+
+    def run(self) -> None:
+        try:
+            result = convert_embedded_artwork(
+                self.album,
+                backup=self.backup,
+                settings=self.settings,
+                progress=lambda done, total, path: self.progress.emit(int(done or 0), int(total or 0), str(path or '')),
+            )
+            self.completed.emit(result)
+        except ApprovalBlocked as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:
+            self.failed.emit(f'Convert/Save failed: {exc}')
 
 
 class SearchWorker(QThread):
@@ -1737,11 +1769,13 @@ class QtArtworkWindow(QMainWindow):
         self.current_art_worker: Optional[CurrentArtWorker] = None
         self.current_art_workers: List[CurrentArtWorker] = []
         self.approval_worker: Optional[ApprovalWorker] = None
+        self.convert_worker: Optional[ConvertSaveWorker] = None
         self.search_worker: Optional[SearchWorker] = None
         self.album_rescan_worker: Optional[AlbumRescanWorker] = None
         self.deep_check_worker: Optional[AlbumDeepCheckWorker] = None
         self.scan_dialog: Optional[ScanDialog] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
+        self.last_convert_result: Optional[Dict[str, Any]] = None
         self.last_search_log: List[str] = []
         self.last_search_album_key = ''
         self.pending_approval_row = 0
@@ -1992,6 +2026,8 @@ class QtArtworkWindow(QMainWindow):
         self.refresh_album_action.triggered.connect(self.refresh_current_album_from_disk)
         self.problem_files_action = QAction(_line_icon('scan'), 'Show Problem Files', self)
         self.problem_files_action.triggered.connect(self.show_problem_files_for_current_album)
+        self.convert_save_action = QAction(_line_icon('refresh'), 'Convert/Save Current Artwork', self)
+        self.convert_save_action.triggered.connect(self.convert_save_current_artwork)
         self.mark_good_action = QAction(_line_icon('check'), 'Mark Current Artwork Good', self)
         self.mark_good_action.triggered.connect(self.mark_current_album_good)
         self.ignore_action = QAction(_line_icon('stop'), 'Ignore Album', self)
@@ -2002,6 +2038,7 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu.addAction(self.choose_release_action)
         self.more_menu.addAction(self.refresh_album_action)
         self.more_menu.addAction(self.problem_files_action)
+        self.more_menu.addAction(self.convert_save_action)
         self.more_menu.addSeparator()
         self.more_menu.addAction(self.mark_good_action)
         self.more_menu.addAction(self.ignore_action)
@@ -2263,6 +2300,7 @@ class QtArtworkWindow(QMainWindow):
         busy = any([
             self.search_worker is not None and self.search_worker.isRunning(),
             self.approval_worker is not None and self.approval_worker.isRunning(),
+            self.convert_worker is not None and self.convert_worker.isRunning(),
         ])
         if not busy:
             self.approval_status.setText('')
@@ -2655,6 +2693,14 @@ class QtArtworkWindow(QMainWindow):
                 _text(self.last_approval_result.get('final_reason'), '-'),
                 f"Files: {int(self.last_approval_result.get('updated_files') or 0)} / {int(self.last_approval_result.get('total_files') or 0)}",
             ])
+        if self.last_convert_result and album and self.last_convert_result.get('album_key') == album.get('album_key'):
+            lines.extend([
+                '',
+                'Last Convert/Save:',
+                _text(self.last_convert_result.get('conversion_reason'), '-'),
+                f"Result: {_text(self.last_convert_result.get('final_bucket'), 'Done')} - {_text(self.last_convert_result.get('final_reason'), '-')}",
+                f"Artwork: {_text(self.last_convert_result.get('embedded_dimensions'), '-')}",
+            ])
         if self.last_search_log and album and self.last_search_album_key == _text(album.get('album_key')):
             recent = [_text(line) for line in self.last_search_log[-3:] if _text(line)]
             if recent:
@@ -2673,10 +2719,11 @@ class QtArtworkWindow(QMainWindow):
     def _refresh_action_states(self) -> None:
         has_candidate = self._selected_candidate() is not None
         approval_busy = self.approval_worker is not None and self.approval_worker.isRunning()
+        convert_busy = self.convert_worker is not None and self.convert_worker.isRunning()
         search_busy = self.search_worker is not None and self.search_worker.isRunning()
         rescan_busy = self.album_rescan_worker is not None and self.album_rescan_worker.isRunning()
         deep_check_busy = self.deep_check_worker is not None and self.deep_check_worker.isRunning()
-        busy = approval_busy or search_busy or rescan_busy or deep_check_busy
+        busy = approval_busy or convert_busy or search_busy or rescan_busy or deep_check_busy
         album = self.current_album or {}
         bucket = self._album_bucket(album) if album else ''
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
@@ -2701,6 +2748,7 @@ class QtArtworkWindow(QMainWindow):
         self.choose_release_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'} and not busy))
         self.refresh_album_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
+        self.convert_save_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket in {'Not Square', 'Convert'} and not busy))
         self.mark_good_action.setEnabled(can_use_active_album)
         self.ignore_action.setEnabled(can_use_active_album)
         self.rework_action.setEnabled(can_rework)
@@ -3349,6 +3397,84 @@ class QtArtworkWindow(QMainWindow):
         if artist or album_name:
             webbrowser.open(google_images_url(artist, album_name))
 
+    def convert_save_current_artwork(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        album_path = _text(album.get('album_path'))
+        if not album_key or not album_path:
+            return
+        if self.convert_worker is not None and self.convert_worker.isRunning():
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        self.last_convert_result = None
+        label = self._album_display_name(album)
+        backup = bool(self.backup_checkbox.isChecked())
+        self._save_backup_preference()
+        self.approval_status.setText(f'Preparing Convert/Save: {label}...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Converting/saving current artwork...')
+        self.pending_approval_row = max(0, self.table.currentRow())
+
+        worker = ConvertSaveWorker(album, backup, self.settings, self)
+        worker.progress.connect(self._convert_save_progress)
+        worker.completed.connect(self._convert_save_completed)
+        worker.failed.connect(self._convert_save_failed)
+        worker.finished.connect(lambda w=worker: self._convert_save_worker_finished(w))
+        self.convert_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
+    def _convert_save_progress(self, done: int, total: int, path: str) -> None:
+        if total > 0:
+            self.approval_progress.setRange(0, total)
+            self.approval_progress.setValue(max(0, min(done, total)))
+            self.approval_status.setText(f'Convert/Save {done}/{total}: {_path_tail(path, parts=2)}')
+            self.statusBar().showMessage(f'Convert/Save {done}/{total}')
+        else:
+            self.approval_progress.setRange(0, 0)
+            self.approval_status.setText(_text(path, 'Preparing Convert/Save...'))
+
+    def _convert_save_completed(self, result: object) -> None:
+        result = dict(result or {})
+        self.last_convert_result = result
+        self.approval_progress.setVisible(False)
+        bucket = _text(result.get('final_bucket'), 'Done')
+        reason = _text(result.get('final_reason'), 'Convert/Save complete.')
+        dims = _text(result.get('embedded_dimensions'), '-')
+        warnings = len(result.get('failed_items') or [])
+        cover = _text(result.get('album_artwork_copy'))
+        message = f'Convert/Save complete: {bucket} ({dims}).'
+        if cover:
+            message += ' cover.jpg saved.'
+        if warnings:
+            message += f' {warnings} warning(s).'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        self.reload_queue(select_first=False)
+        if bucket == 'Good':
+            self._select_next_actionable_row(start_row=self.pending_approval_row)
+        else:
+            self._select_album_key(result.get('album_key'), fallback_first=True)
+        if warnings or bucket in {'Convert', 'Not Square', 'Needs Search', 'Missing'}:
+            QMessageBox.information(self, 'Convert/Save finished', f'{message}\n\n{reason}')
+
+    def _convert_save_failed(self, message: str) -> None:
+        self.approval_progress.setVisible(False)
+        message = _text(message, 'Convert/Save failed.')
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        QMessageBox.warning(self, 'Cannot Convert/Save artwork', message)
+        self._refresh_action_states()
+
+    def _convert_save_worker_finished(self, worker: ConvertSaveWorker) -> None:
+        if self.convert_worker is worker:
+            self.convert_worker = None
+        self._refresh_action_states()
+
     def approve_selected_candidate(self) -> None:
         candidate = self._selected_candidate()
         if not candidate:
@@ -3520,6 +3646,10 @@ class QtArtworkWindow(QMainWindow):
             QMessageBox.information(self, 'Problem file check still running', 'Wait for the selected album check to finish before closing Artwork Manager.')
             event.ignore()
             return
+        if self.convert_worker is not None and self.convert_worker.isRunning():
+            QMessageBox.information(self, 'Convert/Save still running', 'Wait for the selected album Convert/Save to finish before closing Artwork Manager.')
+            event.ignore()
+            return
         if self.queue_filter_save_timer.isActive():
             self.queue_filter_save_timer.stop()
             self._save_queue_filter_state()
@@ -3542,6 +3672,11 @@ class QtArtworkWindow(QMainWindow):
         if self.approval_worker is not None:
             try:
                 self.approval_worker.wait(500)
+            except Exception:
+                pass
+        if self.convert_worker is not None:
+            try:
+                self.convert_worker.wait(500)
             except Exception:
                 pass
         for worker in list(self.current_art_workers):

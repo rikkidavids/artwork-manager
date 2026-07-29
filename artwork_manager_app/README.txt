@@ -1,4 +1,4 @@
-Build 4.78 — Qt choose release
+Build 4.79 — Qt convert/save artwork
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -37,6 +37,7 @@ Build 4.78 — Qt choose release
 - The Qt details pane now shows saved Deep Check summaries and problem-file counts for the selected album.
 - Added Qt NAS Worker Test and Worker Status controls inside Settings, with background checks and concise compatibility/status reporting.
 - Added Qt Choose Release in the More menu, allowing exact MusicBrainz, Deezer, iTunes, or Discogs release artwork to be imported into the normal Review queue.
+- Added Qt Convert/Save Current Artwork for Square/Convert albums, reusing the same Mac/NAS embed pipeline to rewrite current embedded art and save cover.jpg when enabled.
 
 Qt review branch
 
