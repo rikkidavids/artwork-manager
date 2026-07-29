@@ -1,4 +1,4 @@
-Build 4.81 — Qt workflow routing
+Build 4.82 — Qt reject all cleanup
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -40,6 +40,7 @@ Build 4.81 — Qt workflow routing
 - Added Qt Convert/Save Current Artwork for Square/Convert albums, reusing the same Mac/NAS embed pipeline to rewrite current embedded art and save cover.jpg when enabled.
 - Added Qt Convert/Save Next in the More menu, processing the next visible Square/Convert albums in the same order and batch size as Search Next.
 - Search Next now focuses on Missing/Needs Search albums, leaving Square/Convert cleanup to the new Convert/Save actions.
+- Added Qt Reject All Options and app-managed temporary artwork cleanup after approve, reject, skip, mark-good, ignore, and rework actions.
 
 Qt review branch
 

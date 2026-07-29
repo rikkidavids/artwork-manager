@@ -6,6 +6,7 @@ helpers while the migration from the established Tk window continues.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import threading
 import webbrowser
@@ -62,6 +63,8 @@ from . import database as db
 from .config import (
     APP_DIR,
     BUILD_VERSION,
+    IMPORT_DIR,
+    TEMP_DIR,
     get_batch_search_count,
     get_deep_scan_all_files,
     get_fetch_min_artwork_size,
@@ -2082,6 +2085,8 @@ class QtArtworkWindow(QMainWindow):
         self.convert_save_action.triggered.connect(self.convert_save_current_artwork)
         self.convert_save_next_action = QAction(_line_icon('refresh'), 'Convert/Save Next', self)
         self.convert_save_next_action.triggered.connect(self.convert_save_next_artwork)
+        self.reject_all_action = QAction(_line_icon('stop'), 'Reject All Options', self)
+        self.reject_all_action.triggered.connect(self.reject_all_candidates_for_current_album)
         self.mark_good_action = QAction(_line_icon('check'), 'Mark Current Artwork Good', self)
         self.mark_good_action.triggered.connect(self.mark_current_album_good)
         self.ignore_action = QAction(_line_icon('stop'), 'Ignore Album', self)
@@ -2094,6 +2099,7 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu.addAction(self.problem_files_action)
         self.more_menu.addAction(self.convert_save_action)
         self.more_menu.addAction(self.convert_save_next_action)
+        self.more_menu.addAction(self.reject_all_action)
         self.more_menu.addSeparator()
         self.more_menu.addAction(self.mark_good_action)
         self.more_menu.addAction(self.ignore_action)
@@ -2828,6 +2834,7 @@ class QtArtworkWindow(QMainWindow):
         self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.convert_save_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket in {'Not Square', 'Convert'} and not busy))
         self.convert_save_next_action.setEnabled(bool(can_convert_next and not busy))
+        self.reject_all_action.setEnabled(bool(has_album_key and self.current_candidates and not busy))
         self.mark_good_action.setEnabled(can_use_active_album)
         self.ignore_action.setEnabled(can_use_active_album)
         self.rework_action.setEnabled(can_rework)
@@ -3037,6 +3044,66 @@ class QtArtworkWindow(QMainWindow):
             self.search_worker = None
         self._refresh_action_states()
 
+    def _is_path_inside_roots(self, path: Any, roots: tuple[Path, ...]) -> bool:
+        try:
+            candidate = Path(str(path or '')).expanduser().resolve()
+        except Exception:
+            return False
+        for root in roots:
+            try:
+                root_path = Path(root).expanduser().resolve()
+                common = os.path.commonpath([str(candidate), str(root_path)])
+                if common == str(root_path):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _trash_managed_candidate_file(self, path: Any) -> int:
+        if not path or not self._is_path_inside_roots(path, (TEMP_DIR, IMPORT_DIR)):
+            return 0
+        try:
+            src = Path(str(path)).expanduser()
+            if not src.exists() or not src.is_file():
+                return 0
+            trash_dir = Path.home() / '.Trash'
+            if not trash_dir.exists():
+                return 0
+            dest = trash_dir / src.name
+            if dest.exists():
+                stem = src.stem
+                suffix = src.suffix
+                index = 1
+                while dest.exists():
+                    dest = trash_dir / f'{stem}-{index}{suffix}'
+                    index += 1
+            shutil.move(str(src), str(dest))
+            return 1
+        except Exception:
+            return 0
+
+    def _remove_candidate_files(self, candidates: List[Dict[str, Any]]) -> int:
+        removed = 0
+        seen = set()
+        for candidate in candidates or []:
+            path = candidate.get('image_path') if isinstance(candidate, dict) else candidate
+            path_text = _text(path)
+            if not path_text or path_text in seen:
+                continue
+            seen.add(path_text)
+            removed += self._trash_managed_candidate_file(path_text)
+        return removed
+
+    def _remove_candidate_files_for_album(self, album_key: Any, *, include_rejected: bool = True) -> int:
+        key = _text(album_key)
+        if not key:
+            return 0
+        try:
+            candidates = db.load_candidates_for_album(key, include_rejected=include_rejected)
+        except Exception:
+            candidates = []
+        return self._remove_candidate_files(candidates)
+
     def _reclassify_after_candidate_rejection(self, album_key: Any) -> Dict[str, Any]:
         key = _text(album_key)
         if not key:
@@ -3065,26 +3132,77 @@ class QtArtworkWindow(QMainWindow):
         current_row = max(0, self.table.currentRow())
         try:
             db.mark_candidate(candidate.get('candidate_id'), rejected=True)
+            removed = self._remove_candidate_files([candidate])
         except Exception as exc:
             QMessageBox.warning(self, 'Could not reject option', str(exc))
             return
 
         remaining = db.load_candidates_for_album(album_key, include_rejected=False)
+        cleanup_text = f' Trashed {removed} temporary file(s).' if removed else ''
         if remaining and self.current_album:
             self.current_candidates = remaining
             self._load_candidates(self.current_album)
             self.candidate_list.setCurrentRow(min(self.candidate_list.count() - 1, max(0, self.candidate_list.currentRow())))
             self._render_details(self._selected_candidate())
-            self.approval_status.setText('Rejected artwork option.')
-            self.statusBar().showMessage('Rejected artwork option.')
+            self.approval_status.setText(f'Rejected artwork option.{cleanup_text}')
+            self.statusBar().showMessage(f'Rejected artwork option.{cleanup_text}')
             self.reload_queue(select_first=False)
             self._select_album_key(album_key, fallback_first=True)
         else:
             self._reclassify_after_candidate_rejection(album_key)
             self.reload_queue(select_first=False)
             self._select_next_actionable_row(start_row=current_row)
-            self.approval_status.setText('Rejected the last option. Album moved back to search.')
-            self.statusBar().showMessage('Rejected the last option.')
+            self.approval_status.setText(f'Rejected the last option. Album moved back to search.{cleanup_text}')
+            self.statusBar().showMessage(f'Rejected the last option.{cleanup_text}')
+        self._refresh_action_states()
+
+    def reject_all_candidates_for_current_album(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        if not album_key:
+            return
+        try:
+            candidates = db.load_candidates_for_album(album_key, include_rejected=False)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Could not load options', str(exc))
+            return
+        if not candidates:
+            self.approval_status.setText('No saved artwork options to reject.')
+            self.statusBar().showMessage('No saved artwork options to reject.')
+            self._refresh_action_states()
+            return
+        label = self._album_display_name(album)
+        answer = QMessageBox.question(
+            self,
+            'Reject all artwork options?',
+            f'Reject all {len(candidates)} saved artwork option(s) for {label}?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        current_row = max(0, self.table.currentRow())
+        try:
+            db.mark_album_candidates(album_key, rejected=True, state_reason='all options rejected by user')
+            self._reclassify_after_candidate_rejection(album_key)
+            removed = self._remove_candidate_files(candidates)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Could not reject options', str(exc))
+            return
+        self.reload_queue(select_first=False)
+        if not self._select_album_key(album_key, fallback_first=False):
+            target_filter = self._queue_filter_for_album_key(album_key)
+            if target_filter:
+                self.queue_filter = target_filter
+                self.apply_filters()
+                self._schedule_queue_filter_state_save()
+                self._select_album_key(album_key, fallback_first=True)
+            else:
+                self._select_next_actionable_row(start_row=current_row)
+        cleanup_text = f' Trashed {removed} temporary file(s).' if removed else ''
+        message = f'Rejected all {len(candidates)} option(s) for {label}.{cleanup_text}'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
         self._refresh_action_states()
 
     def skip_current_album(self) -> None:
@@ -3107,12 +3225,15 @@ class QtArtworkWindow(QMainWindow):
         try:
             db.set_album_status(album_key, 'reviewed_skipped')
             db.mark_album_candidates(album_key, rejected=True)
+            removed = self._remove_candidate_files_for_album(album_key, include_rejected=True)
         except Exception as exc:
             QMessageBox.warning(self, 'Could not skip album', str(exc))
             return
         self.reload_queue(select_first=False)
         self._select_next_actionable_row(start_row=current_row)
         message = f'Skipped {artist} - {album_name}.'
+        if removed:
+            message += f' Trashed {removed} temporary file(s).'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
         self._refresh_action_states()
@@ -3165,12 +3286,15 @@ class QtArtworkWindow(QMainWindow):
         try:
             self._mark_album_good_in_db(album_key)
             db.mark_album_candidates(album_key, rejected=True, state_reason='album marked good by user')
+            removed = self._remove_candidate_files_for_album(album_key, include_rejected=True)
         except Exception as exc:
             QMessageBox.warning(self, 'Could not mark album Good', str(exc))
             return
         self.reload_queue(select_first=False)
         self._select_next_actionable_row(start_row=current_row)
         message = f'Marked Good: {label}.'
+        if removed:
+            message += f' Trashed {removed} temporary file(s).'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
         self._refresh_action_states()
@@ -3194,12 +3318,15 @@ class QtArtworkWindow(QMainWindow):
         try:
             db.set_album_status(album_key, 'ignored')
             db.mark_album_candidates(album_key, rejected=True, state_reason='album ignored by user')
+            removed = self._remove_candidate_files_for_album(album_key, include_rejected=True)
         except Exception as exc:
             QMessageBox.warning(self, 'Could not ignore album', str(exc))
             return
         self.reload_queue(select_first=False)
         self._select_next_actionable_row(start_row=current_row)
         message = f'Ignored: {label}.'
+        if removed:
+            message += f' Trashed {removed} temporary file(s).'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
         self._refresh_action_states()
@@ -3242,6 +3369,7 @@ class QtArtworkWindow(QMainWindow):
             return
         try:
             fresh = db.get_album(album_key) or album
+            candidates = db.load_candidates_for_album(album_key, include_rejected=True)
             removed_rows = db.delete_candidates_for_album(album_key)
             new_status = self._reopened_status_for_album(fresh)
             db.set_album_status(album_key, new_status)
@@ -3249,6 +3377,7 @@ class QtArtworkWindow(QMainWindow):
                 'reworked_at': db.now(),
                 'reworked_reason': 'Manual Rework Album action',
             })
+            removed_files = self._remove_candidate_files(candidates)
         except Exception as exc:
             QMessageBox.warning(self, 'Could not rework album', str(exc))
             return
@@ -3257,6 +3386,8 @@ class QtArtworkWindow(QMainWindow):
         self._set_queue_filter('Needs Work')
         self._select_album_key(album_key, fallback_first=True)
         message = f'Reworked: {label}. Cleared {removed_rows} saved option row(s).'
+        if removed_files:
+            message += f' Trashed {removed_files} temporary file(s).'
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
         self._refresh_action_states()
@@ -3700,7 +3831,10 @@ class QtArtworkWindow(QMainWindow):
         updated = int(result.get('updated_files') or result.get('updated') or 0)
         total = int(result.get('total_files') or result.get('total') or 0)
         if complete:
+            removed = self._remove_candidate_files_for_album(result.get('album_key'), include_rejected=True)
             message = f'Approved and embedded artwork into {updated}/{total} file(s).'
+            if removed:
+                message += f' Trashed {removed} temporary file(s).'
             self.approval_status.setText(message)
             self.statusBar().showMessage(message)
         else:
