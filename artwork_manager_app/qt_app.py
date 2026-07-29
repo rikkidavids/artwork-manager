@@ -4183,69 +4183,106 @@ class QtArtworkWindow(QMainWindow):
             notes = album.get('notes') or {}
         deep = notes.get('deep_file_check') if isinstance(notes.get('deep_file_check'), dict) else {}
         bucket = workflow_bucket_for_status(status)
-        sections = [
-            self._details_section('Summary', [
-                ('Status', bucket),
-                ('Why', reason or _text(status, 'No status recorded')),
-                ('Options', f"{int(album.get('candidate_count') or 0)} saved"),
-            ]),
-            self._details_section('Current Artwork', [
-                ('Embedded size', _album_size(album)),
-                ('Deep check', _deep_check_summary_text(deep) if deep else 'Not run'),
-            ]),
-            self._details_section('Folder', [
-                ('Album folder', _text(album.get('album_path'), '-')),
-            ]),
+        title = self._details_title(bucket, candidate)
+        message = self._details_message(album, bucket, deep, candidate, reason)
+        facts = self._details_facts(album, bucket, deep, candidate)
+        next_step = self._details_next_step(bucket, bool(candidate))
+        body = [
+            f'<div class="hero"><div class="state">{escape(title)}</div><div class="message">{escape(message)}</div></div>',
+            self._details_fact_grid(facts),
+            f'<div class="next"><span>Next</span> {escape(next_step)}</div>',
         ]
-        if deep:
-            deep_rows = []
-            first_issue = _text(deep.get('first_issue_file') or deep.get('first_non_square_file'))
-            if first_issue:
-                deep_rows.append(('First issue', first_issue))
-            problem_files = notes.get('last_problem_files') if isinstance(notes.get('last_problem_files'), dict) else {}
-            if problem_files.get('problem_count'):
-                deep_rows.append(('Problem files', str(int(problem_files.get('problem_count') or 0))))
-            if deep_rows:
-                sections.append(self._details_section('Deep Check', deep_rows))
         if candidate:
             warnings = candidate.get('warnings') or []
             if isinstance(warnings, str):
                 warnings = [warnings]
-            source_page = self.source_page_url_from_candidate(candidate)
-            candidate_rows = [
-                ('Source', _text(candidate.get('source'), '-')),
-                ('Release', _text(candidate.get('release_title'), '-')),
-                ('Size', f"{_text(candidate.get('width'), '?')} x {_text(candidate.get('height'), '?')}"),
-                ('Score', f"{int(candidate.get('score') or 0)}/100"),
-                ('Source page', 'Available' if source_page else '-'),
-            ]
             clean_warnings = '; '.join(_text(w) for w in warnings if _text(w))
             if clean_warnings:
-                candidate_rows.append(('Warnings', clean_warnings))
-            summary = _text(candidate.get('score_summary'))
-            if summary:
-                candidate_rows.append(('Score summary', summary))
-            sections.append(self._details_section('Selected Candidate', candidate_rows))
-        elif self.current_candidates:
-            sections.append(self._details_section('Candidate', [('Selected', 'Choose an option to preview it.')]))
-        else:
-            sections.append(self._details_section('Candidate', [('Saved options', 'None yet.')]))
+                body.append(f'<div class="note warning"><span>Check</span> {escape(clean_warnings)}</div>')
         if self.last_approval_result and album and self.last_approval_result.get('album_key') == album.get('album_key'):
-            sections.append(self._details_section('Last Approval', [
-                ('Result', _text(self.last_approval_result.get('final_reason'), '-')),
-                ('Files', f"{int(self.last_approval_result.get('updated_files') or 0)} / {int(self.last_approval_result.get('total_files') or 0)}"),
-            ]))
+            files = f"{int(self.last_approval_result.get('updated_files') or 0)} / {int(self.last_approval_result.get('total_files') or 0)}"
+            body.append(f'<div class="note"><span>Last embed</span> {escape(files)} files updated.</div>')
         if self.last_convert_result and album and self.last_convert_result.get('album_key') == album.get('album_key'):
-            sections.append(self._details_section('Last Convert/Save', [
-                ('Reason', _text(self.last_convert_result.get('conversion_reason'), '-')),
-                ('Result', f"{_text(self.last_convert_result.get('final_bucket'), 'Done')} - {_text(self.last_convert_result.get('final_reason'), '-')}"),
-                ('Artwork', _text(self.last_convert_result.get('embedded_dimensions'), '-')),
-            ]))
+            result = _text(self.last_convert_result.get('final_bucket'), 'Done')
+            artwork = _text(self.last_convert_result.get('embedded_dimensions'), '-')
+            body.append(f'<div class="note"><span>Last fix</span> {escape(result)} - {escape(artwork)}</div>')
         if self.last_search_log and album and self.last_search_album_key == _text(album.get('album_key')):
-            recent = [_text(line) for line in self.last_search_log[-4:] if _text(line)]
+            recent = [_text(line) for line in self.last_search_log[-2:] if _text(line)]
             if recent:
-                sections.append(self._details_log_section('Recent Search', recent))
-        self.details.setHtml(self._details_document(''.join(sections)))
+                body.append(self._details_log_section('Recent search', recent))
+        self.details.setHtml(self._details_document(''.join(body)))
+
+    def _details_title(self, bucket: str, candidate: Optional[Dict[str, Any]]) -> str:
+        if candidate:
+            return 'Artwork option ready'
+        return {
+            'Missing': 'Needs artwork',
+            'Needs Search': 'Needs a better cover',
+            'Not Square': 'Needs a square cover',
+            'Convert': 'Needs fixing',
+            'Review': 'Ready to review',
+            'Good': 'Looks good',
+            'Handled': 'Done',
+        }.get(bucket, _text(bucket, 'Album selected'))
+
+    def _details_message(self, album: Dict[str, Any], bucket: str, deep: Dict[str, Any], candidate: Optional[Dict[str, Any]], reason: str) -> str:
+        if candidate:
+            source = _text(candidate.get('source'), 'A provider')
+            dims = self._candidate_short_size(candidate)
+            return f'{source} found a {dims} cover. Check it matches this album before embedding.'
+        checked = _deep_count(deep, 'checked_files')
+        missing = _deep_count(deep, 'missing_count')
+        if bucket == 'Missing':
+            if checked and missing:
+                return f'No embedded cover was found in {missing} of {checked} tracks.'
+            return 'No embedded cover was found for this album.'
+        if bucket == 'Needs Search':
+            return 'No saved artwork option is ready yet.'
+        if bucket == 'Not Square':
+            return 'The current artwork is not square.'
+        if bucket == 'Convert':
+            return 'The current artwork needs converting or saving.'
+        if bucket == 'Review':
+            return 'There are saved artwork options waiting to be checked.'
+        if bucket in {'Good', 'Handled'}:
+            return 'No action is needed for this album.'
+        return _text(reason, 'Check this album when you have a moment.')
+
+    def _details_facts(self, album: Dict[str, Any], bucket: str, deep: Dict[str, Any], candidate: Optional[Dict[str, Any]]) -> List[tuple[str, Any]]:
+        if candidate:
+            release = _text(candidate.get('release_title'))
+            facts = [
+                ('Source', _text(candidate.get('source'), '-')),
+                ('Size', self._candidate_short_size(candidate)),
+                ('Score', f"{int(candidate.get('score') or 0)}/100"),
+            ]
+            if release and release != _text(album.get('album')):
+                facts.append(('Release', release))
+            return facts[:4]
+        facts = [
+            ('Current', 'No cover' if bucket == 'Missing' else _album_size(album)),
+            ('Options', f"{int(album.get('candidate_count') or 0)} saved"),
+        ]
+        checked = _deep_count(deep, 'checked_files')
+        if checked:
+            facts.append(('Checked', f'{checked} tracks'))
+        return facts
+
+    def _details_next_step(self, bucket: str, has_candidate: bool) -> str:
+        if has_candidate:
+            return 'Approve it if it is the right cover, or reject it and keep looking.'
+        if bucket in {'Missing', 'Needs Search'}:
+            return 'Find artwork.'
+        if bucket in {'Not Square', 'Convert'}:
+            return 'Convert/save the current artwork.'
+        if bucket == 'Review':
+            return 'Choose an artwork option.'
+        return 'Nothing needed.'
+
+    def _candidate_short_size(self, candidate: Dict[str, Any]) -> str:
+        width = _text(candidate.get('width'), '?')
+        height = _text(candidate.get('height'), '?')
+        return f'{width} x {height}'
 
     def _details_document(self, body: str) -> str:
         return f"""
@@ -4253,13 +4290,16 @@ class QtArtworkWindow(QMainWindow):
         <head>
             <style>
                 body {{ color: #1d1d1f; font-size: 13px; margin: 0; }}
-                .section {{ margin-bottom: 14px; }}
-                .title {{ color: #111827; font-size: 13px; font-weight: 700; margin-bottom: 6px; }}
-                table {{ border-collapse: collapse; width: 100%; }}
-                td {{ vertical-align: top; padding: 1px 0 5px 0; }}
-                td.label {{ color: #6b7280; width: 108px; padding-right: 12px; white-space: nowrap; }}
-                td.value {{ color: #1d1d1f; }}
-                .log {{ color: #374151; background: #f8fafc; border: 1px solid #edf0f5; border-radius: 4px; padding: 7px 8px; }}
+                .hero {{ margin-bottom: 14px; }}
+                .state {{ color: #111827; font-size: 16px; font-weight: 700; margin-bottom: 5px; }}
+                .message {{ color: #374151; line-height: 1.35; }}
+                .facts {{ margin-bottom: 13px; }}
+                .fact {{ margin-bottom: 6px; }}
+                .fact span, .next span, .note span {{ color: #6b7280; display: inline-block; width: 70px; }}
+                .next {{ color: #111827; background: #f8fafc; border: 1px solid #edf0f5; border-radius: 4px; padding: 7px 8px; margin-bottom: 10px; }}
+                .note {{ color: #374151; margin-top: 8px; }}
+                .warning {{ color: #7c2d12; }}
+                .log {{ color: #4b5563; margin-top: 10px; }}
                 .empty {{ color: #6b7280; }}
             </style>
         </head>
@@ -4267,16 +4307,16 @@ class QtArtworkWindow(QMainWindow):
         </html>
         """
 
-    def _details_section(self, title: str, rows: List[tuple[str, Any]]) -> str:
+    def _details_fact_grid(self, rows: List[tuple[str, Any]]) -> str:
         row_html = ''.join(
-            f'<tr><td class="label">{escape(_text(label))}</td><td class="value">{escape(_text(value, "-"))}</td></tr>'
+            f'<div class="fact"><span>{escape(_text(label))}</span> {escape(_text(value, "-"))}</div>'
             for label, value in rows
         )
-        return f'<div class="section"><div class="title">{escape(_text(title))}</div><table>{row_html}</table></div>'
+        return f'<div class="facts">{row_html}</div>'
 
     def _details_log_section(self, title: str, lines: List[str]) -> str:
-        body = '<br>'.join(escape(_text(line)) for line in lines if _text(line))
-        return f'<div class="section"><div class="title">{escape(_text(title))}</div><div class="log">{body}</div></div>'
+        body = ' · '.join(escape(_text(line)) for line in lines if _text(line))
+        return f'<div class="log">{escape(_text(title))}: {body}</div>'
 
     def _save_backup_preference(self, checked: Optional[bool] = None) -> None:
         try:
