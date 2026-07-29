@@ -1127,6 +1127,18 @@ class QtArtworkWindow(QMainWindow):
 
         options = QHBoxLayout()
         options.addStretch(1)
+        self.open_folder_btn = QPushButton('Open Album Folder')
+        self.open_folder_btn.setObjectName('quietButton')
+        self.open_folder_btn.setIcon(_line_icon('folder'))
+        self.open_folder_btn.setIconSize(QSize(16, 16))
+        self.open_folder_btn.clicked.connect(self.open_album_folder)
+        self.open_source_btn = QPushButton('Open Source Page')
+        self.open_source_btn.setObjectName('quietButton')
+        self.open_source_btn.setIcon(_line_icon('link'))
+        self.open_source_btn.setIconSize(QSize(16, 16))
+        self.open_source_btn.clicked.connect(self.open_source_page)
+        options.addWidget(self.open_folder_btn)
+        options.addWidget(self.open_source_btn)
         self.backup_checkbox = QCheckBox('Backup before embed')
         self.backup_checkbox.setObjectName('inlineOption')
         self.backup_checkbox.setChecked(bool(self.settings.get('backup_before_embedding', False)))
@@ -1165,20 +1177,21 @@ class QtArtworkWindow(QMainWindow):
         self.approve_btn.clicked.connect(self.approve_selected_candidate)
         actions.addWidget(self.approve_btn)
 
-        actions.addStretch(1)
+        self.reject_btn = QPushButton('Reject Option')
+        self.reject_btn.setObjectName('quietButton')
+        self.reject_btn.setIcon(_line_icon('stop'))
+        self.reject_btn.setIconSize(QSize(16, 16))
+        self.reject_btn.setToolTip('Reject the selected saved artwork option')
+        self.reject_btn.clicked.connect(self.reject_selected_candidate)
+        actions.addWidget(self.reject_btn)
 
-        self.open_folder_btn = QPushButton('Open Album Folder')
-        self.open_folder_btn.setObjectName('quietButton')
-        self.open_folder_btn.setIcon(_line_icon('folder'))
-        self.open_folder_btn.setIconSize(QSize(16, 16))
-        self.open_folder_btn.clicked.connect(self.open_album_folder)
-        self.open_source_btn = QPushButton('Open Source Page')
-        self.open_source_btn.setObjectName('quietButton')
-        self.open_source_btn.setIcon(_line_icon('link'))
-        self.open_source_btn.setIconSize(QSize(16, 16))
-        self.open_source_btn.clicked.connect(self.open_source_page)
-        actions.addWidget(self.open_folder_btn)
-        actions.addWidget(self.open_source_btn)
+        self.skip_btn = QPushButton('Skip Album')
+        self.skip_btn.setObjectName('quietButton')
+        self.skip_btn.setToolTip('Mark this album as handled without embedding artwork')
+        self.skip_btn.clicked.connect(self.skip_current_album)
+        actions.addWidget(self.skip_btn)
+
+        actions.addStretch(1)
         layout.addLayout(actions)
         return panel
 
@@ -1774,6 +1787,8 @@ class QtArtworkWindow(QMainWindow):
         self.stop_search_btn.setVisible(search_busy)
         self.stop_search_btn.setEnabled(search_busy)
         self.approve_btn.setEnabled(has_candidate and not busy)
+        self.reject_btn.setEnabled(has_candidate and not busy)
+        self.skip_btn.setEnabled(bool(album and bucket not in {'Good', 'Handled'} and not busy))
         self.backup_checkbox.setEnabled(not busy)
         self.open_folder_btn.setEnabled(bool(self.current_album and _text(self.current_album.get('album_path'))))
         self.open_source_btn.setEnabled(bool(has_candidate and _text((self._selected_candidate() or {}).get('source_url'))))
@@ -1970,6 +1985,86 @@ class QtArtworkWindow(QMainWindow):
     def _search_worker_finished(self, worker: SearchWorker) -> None:
         if self.search_worker is worker:
             self.search_worker = None
+        self._refresh_action_states()
+
+    def _reclassify_after_candidate_rejection(self, album_key: Any) -> Dict[str, Any]:
+        key = _text(album_key)
+        if not key:
+            return {'status': '', 'reason': ''}
+        try:
+            db.set_album_status(key, 'no_candidate', reason='all saved artwork options rejected')
+            return db.evaluate_and_set_album_state(
+                key,
+                candidate_count=0,
+                preserve_user_terminal=False,
+                settings=self.settings,
+            )
+        except Exception:
+            try:
+                db.set_album_status(key, 'no_candidate', reason='all saved artwork options rejected')
+            except Exception:
+                pass
+            return {'status': 'no_candidate', 'reason': 'all saved artwork options rejected'}
+
+    def reject_selected_candidate(self) -> None:
+        candidate = self._selected_candidate()
+        album = self.current_album or {}
+        album_key = _text((candidate or {}).get('album_key') or album.get('album_key'))
+        if not candidate or not album_key:
+            return
+        current_row = max(0, self.table.currentRow())
+        try:
+            db.mark_candidate(candidate.get('candidate_id'), rejected=True)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Could not reject option', str(exc))
+            return
+
+        remaining = db.load_candidates_for_album(album_key, include_rejected=False)
+        if remaining and self.current_album:
+            self.current_candidates = remaining
+            self._load_candidates(self.current_album)
+            self.candidate_list.setCurrentRow(min(self.candidate_list.count() - 1, max(0, self.candidate_list.currentRow())))
+            self._render_details(self._selected_candidate())
+            self.approval_status.setText('Rejected artwork option.')
+            self.statusBar().showMessage('Rejected artwork option.')
+            self.reload_queue(select_first=False)
+            self._select_album_key(album_key, fallback_first=True)
+        else:
+            self._reclassify_after_candidate_rejection(album_key)
+            self.reload_queue(select_first=False)
+            self._select_next_actionable_row(start_row=current_row)
+            self.approval_status.setText('Rejected the last option. Album moved back to search.')
+            self.statusBar().showMessage('Rejected the last option.')
+        self._refresh_action_states()
+
+    def skip_current_album(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        if not album_key:
+            return
+        artist = _text(album.get('artist'), 'Unknown Artist')
+        album_name = _text(album.get('album'), 'Unknown Album')
+        answer = QMessageBox.question(
+            self,
+            'Skip album?',
+            f'Skip {artist} - {album_name} and remove it from the active review workflow?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        current_row = max(0, self.table.currentRow())
+        try:
+            db.set_album_status(album_key, 'reviewed_skipped')
+            db.mark_album_candidates(album_key, rejected=True)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Could not skip album', str(exc))
+            return
+        self.reload_queue(select_first=False)
+        self._select_next_actionable_row(start_row=current_row)
+        message = f'Skipped {artist} - {album_name}.'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
         self._refresh_action_states()
 
     def approve_selected_candidate(self) -> None:
