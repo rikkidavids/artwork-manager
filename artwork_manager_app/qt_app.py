@@ -2679,6 +2679,29 @@ class CandidateOptionWidget(QFrame):
         return QSize(0, 66)
 
 
+class EmptyCandidateWidget(QFrame):
+    def __init__(self, title: str, hint: str):
+        super().__init__()
+        self.setObjectName('candidateEmpty')
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        title_label = QLabel(_text(title, 'No artwork options'))
+        title_label.setObjectName('candidateEmptyTitle')
+        title_label.setWordWrap(True)
+        hint_label = QLabel(_text(hint))
+        hint_label.setObjectName('candidateEmptyHint')
+        hint_label.setWordWrap(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(4)
+        layout.addWidget(title_label)
+        layout.addWidget(hint_label)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt naming
+        return QSize(0, 92)
+
+
 class ProblemFilesDialog(QDialog):
     def __init__(self, album: Dict[str, Any], result: Dict[str, Any], parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -4096,8 +4119,28 @@ class QtArtworkWindow(QMainWindow):
             self.candidate_list.setCurrentRow(0)
             self._select_candidate(0)
         else:
+            self._show_empty_candidate_hint(album)
             self.candidate_panel.set_placeholder('No candidate artwork')
         self._refresh_action_states()
+
+    def _empty_candidate_copy(self, album: Dict[str, Any]) -> tuple[str, str]:
+        bucket = self._album_bucket(album)
+        if bucket in {'Missing', 'Needs Search'}:
+            return 'No artwork options yet', 'Use Find Artwork to search providers for this album.'
+        if bucket in {'Not Square', 'Convert'}:
+            return 'No replacement options', 'Use Convert/Save to fix the current artwork, or Find Artwork to search for a new cover.'
+        if bucket == 'Review':
+            return 'No saved options', 'Search again or import artwork if this album still needs a cover.'
+        return 'No artwork options', 'This album does not have any saved replacement covers.'
+
+    def _show_empty_candidate_hint(self, album: Dict[str, Any]) -> None:
+        title, hint = self._empty_candidate_copy(album)
+        widget = EmptyCandidateWidget(title, hint)
+        item = QListWidgetItem()
+        item.setFlags(Qt.NoItemFlags)
+        item.setSizeHint(widget.sizeHint())
+        self.candidate_list.addItem(item)
+        self.candidate_list.setItemWidget(item, widget)
 
     def _select_candidate(self, row: int) -> None:
         self._refresh_candidate_option_selection(row)
@@ -6438,6 +6481,19 @@ class QtArtworkWindow(QMainWindow):
                 font-size: 12px;
             }
             QLabel#candidateRelease {
+                color: #6b7280;
+                font-size: 12px;
+            }
+            QFrame#candidateEmpty {
+                background: #fbfbfd;
+                border: 1px dashed #dfe3eb;
+                border-radius: 6px;
+            }
+            QLabel#candidateEmptyTitle {
+                color: #374151;
+                font-weight: 700;
+            }
+            QLabel#candidateEmptyHint {
                 color: #6b7280;
                 font-size: 12px;
             }
