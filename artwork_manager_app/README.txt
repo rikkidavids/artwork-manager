@@ -1,5 +1,7 @@
-Build 4.92 — Qt provider order and undo
+Build 4.93 — Qt source URL import
 
+- Added Qt Import From URL for Deezer, Apple/iTunes, MusicBrainz, Discogs release links, Google redirect links, and direct image URLs.
+- Open Source Page now prefers the album/release page where available instead of only opening the raw artwork image URL.
 - Added Qt provider search-order controls in Settings, with Move Up, Move Down, and Recommended ordering.
 - Added Qt Undo Last Embed under Album Tools > Maintenance for quickly restoring the most recent backed-up embed while testing.
 - Cleaned the Qt review surface by moving Import, folder/source links, backup, diagnostics, and repair tools into a grouped Album Tools menu.

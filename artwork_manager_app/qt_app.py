@@ -7,14 +7,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, unquote, urlparse
+
+import requests
 
 from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
@@ -31,6 +35,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -68,9 +73,11 @@ from .config import (
     APPROVED_DIR,
     BUILD_VERSION,
     DATA_DIR,
+    IMAGE_EXTENSIONS,
     IMPORT_DIR,
     REPORT_DIR,
     TEMP_DIR,
+    USER_AGENT,
     get_batch_search_count,
     get_deep_scan_all_files,
     get_fetch_min_artwork_size,
@@ -790,6 +797,211 @@ class ReleaseImportWorker(QThread):
                     }
                 })
             self.completed.emit({'album_key': album_key, 'added': added})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class SourceUrlImportWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, info: Dict[str, Any], raw_value: str, settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.info = dict(info or {})
+        self.raw_value = _text(raw_value)
+        self.settings = dict(settings or {})
+
+    def _source_values(self) -> List[str]:
+        out: List[str] = []
+
+        def add(value: Any) -> None:
+            text = _text(value).strip()
+            if not text:
+                return
+            for item in (text, unquote(text)):
+                item = _text(item).strip()
+                if item and item not in out:
+                    out.append(item)
+
+        for value in DeezerProvider.unwrap_source_url(self.raw_value):
+            add(value)
+        for value in list(out):
+            try:
+                parsed = urlparse(value)
+                qs = parse_qs(parsed.query or '')
+            except Exception:
+                continue
+            for key in ('url', 'q', 'u', 'imgurl'):
+                for nested in qs.get(key, []):
+                    add(nested)
+        return out
+
+    def _direct_image_url(self, values: List[str]) -> str:
+        for value in values:
+            try:
+                parsed = urlparse(value)
+            except Exception:
+                continue
+            if parsed.scheme not in {'http', 'https'}:
+                continue
+            lower_path = (parsed.path or '').lower()
+            if lower_path.endswith(IMAGE_EXTENSIONS):
+                return value
+        return ''
+
+    def _suffix_for_download(self, url: str, content_type: str) -> str:
+        ctype = _text(content_type).lower()
+        if 'png' in ctype:
+            return '.png'
+        if 'webp' in ctype:
+            return '.webp'
+        if 'jpeg' in ctype or 'jpg' in ctype:
+            return '.jpg'
+        suffix = Path(urlparse(url).path or '').suffix.lower()
+        if suffix in IMAGE_EXTENSIONS:
+            return suffix
+        return '.jpg'
+
+    def _save_provider_candidates(self, candidates: List[Dict[str, Any]], source_label: str) -> int:
+        album_key = _text(self.info.get('album_key'))
+        album_path = _text(self.info.get('album_path'))
+        added = 0
+        for cand in candidates or []:
+            cand = dict(cand or {})
+            cand.update({'album_folder': album_path})
+            cand['candidate_id'] = db.add_candidate(album_key, cand)
+            added += 1
+        if added:
+            db.set_album_status(album_key, 'candidate_found')
+            db.update_album_notes(album_key, {
+                'state_evaluation': {
+                    'status': 'candidate_found',
+                    'reason': f'{added} artwork option(s) imported from {source_label}',
+                }
+            })
+        return added
+
+    def _import_direct_image(self, url: str) -> int:
+        response = requests.get(url, headers={'User-Agent': USER_AGENT}, timeout=30)
+        response.raise_for_status()
+        content_type = response.headers.get('Content-Type', '')
+        if 'image/' not in content_type.lower() and not urlparse(url).path.lower().endswith(IMAGE_EXTENSIONS):
+            raise ValueError('That URL did not look like a downloadable image.')
+        suffix = self._suffix_for_download(url, content_type)
+        temp_path = ''
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+                handle.write(response.content)
+                temp_path = handle.name
+            manual_import(
+                temp_path,
+                _text(self.info.get('artist'), 'Unknown Artist'),
+                _text(self.info.get('album'), 'Unknown Album'),
+                _text(self.info.get('album_key')),
+                _text(self.info.get('album_path')),
+            )
+        finally:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
+        album_key = _text(self.info.get('album_key'))
+        db.set_album_status(album_key, 'candidate_found')
+        db.update_album_notes(album_key, {
+            'state_evaluation': {
+                'status': 'candidate_found',
+                'reason': 'direct image URL imported',
+            }
+        })
+        return 1
+
+    def _fetch_discogs_release_candidates(self, release_id: str, artist: str, album: str, album_key: str, max_candidates: int) -> List[Dict[str, Any]]:
+        provider = DiscogsProvider()
+        response = provider.session.get(f'https://api.discogs.com/releases/{release_id}', timeout=20)
+        response.raise_for_status()
+        payload = response.json() if response.content else {}
+        images = payload.get('images') if isinstance(payload.get('images'), list) else []
+        image = images[0] if images else {}
+        formats = payload.get('formats') if isinstance(payload.get('formats'), list) else []
+        res = {
+            'id': release_id,
+            'title': payload.get('title') or album,
+            'year': payload.get('year') or '',
+            'country': payload.get('country') or '',
+            'format': [fmt.get('name') for fmt in formats if isinstance(fmt, dict) and fmt.get('name')],
+            'cover_image': image.get('uri') or image.get('resource_url') or '',
+            'thumb': image.get('uri150') or '',
+        }
+        if not res.get('cover_image') and not res.get('thumb'):
+            raise ValueError('Discogs did not return usable artwork for that release.')
+        return provider.get_candidates_from_release(artist, album, album_key, res, max_candidates=max_candidates)
+
+    def run(self) -> None:
+        try:
+            album_key = _text(self.info.get('album_key'))
+            album_path = _text(self.info.get('album_path'))
+            if not album_key:
+                raise ValueError('The selected album has no saved queue key.')
+            if not album_path:
+                raise ValueError('The selected album has no saved folder path.')
+            value = self.raw_value.strip()
+            if not value:
+                raise ValueError('Paste a source URL, release ID, or direct image URL first.')
+
+            values = self._source_values()
+            decoded_value = ' '.join(values)
+            artist = _text(self.info.get('search_artist') or self.info.get('artist'), 'Unknown Artist')
+            album = _text(self.info.get('search_album') or self.info.get('album'), 'Unknown Album')
+            max_candidates = get_max_candidates_per_album(self.settings)
+
+            direct_image = self._direct_image_url(values)
+            if direct_image:
+                added = self._import_direct_image(direct_image)
+                self.completed.emit({'album_key': album_key, 'added': added, 'source': 'direct image URL'})
+                return
+
+            deezer_album_id = DeezerProvider.extract_album_id(value)
+            apple_match = re.search(r'(?:id|/)(\d{5,})(?:\D|$)', decoded_value, re.I)
+            mb_match = (
+                re.search(r'musicbrainz\.org/release/([0-9a-f-]{36})', decoded_value, re.I)
+                or re.search(r'\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b', decoded_value, re.I)
+            )
+            discogs_match = re.search(r'discogs\.com/(?:[^/]+/)?release/(\d+)', decoded_value, re.I)
+
+            if deezer_album_id and not ('music.apple' in decoded_value.lower() or 'itunes.apple' in decoded_value.lower()):
+                provider = DeezerProvider()
+                item = provider.fetch_album(deezer_album_id)
+                if not item:
+                    raise ValueError('Deezer did not return album details for that ID.')
+                cands = provider.get_candidates_from_release(artist, album, album_key, item, max_candidates=max_candidates)
+                added = self._save_provider_candidates(cands, 'Deezer')
+                self.completed.emit({'album_key': album_key, 'added': added, 'source': 'Deezer'})
+            elif 'music.apple' in decoded_value.lower() or 'itunes.apple' in decoded_value.lower() or (apple_match and 'deezer' not in decoded_value.lower()):
+                album_id = apple_match.group(1) if apple_match else value
+                provider = ITunesProvider()
+                data = provider._get_json(f'https://itunes.apple.com/lookup?id={album_id}&entity=album')
+                results = (data or {}).get('results') or []
+                item = next((row for row in results if row.get('collectionId')), results[0] if results else None)
+                if not item:
+                    raise ValueError('Apple/iTunes did not return album details for that ID.')
+                cands = provider.get_candidates_from_release(artist, album, album_key, item, max_candidates=max_candidates)
+                added = self._save_provider_candidates(cands, 'Apple/iTunes')
+                self.completed.emit({'album_key': album_key, 'added': added, 'source': 'Apple/iTunes'})
+            elif mb_match:
+                provider = MusicBrainzProvider()
+                rel = provider.fetch_release(mb_match.group(1))
+                if not rel:
+                    raise ValueError('MusicBrainz did not return that release.')
+                cands = provider.get_candidates_from_release(artist, album, album_key, rel, max_candidates=max_candidates)
+                added = self._save_provider_candidates(cands, 'MusicBrainz')
+                self.completed.emit({'album_key': album_key, 'added': added, 'source': 'MusicBrainz'})
+            elif discogs_match:
+                cands = self._fetch_discogs_release_candidates(discogs_match.group(1), artist, album, album_key, max_candidates)
+                added = self._save_provider_candidates(cands, 'Discogs')
+                self.completed.emit({'album_key': album_key, 'added': added, 'source': 'Discogs'})
+            else:
+                raise ValueError('I could not recognise that URL. Try a Deezer, Apple/iTunes, MusicBrainz, Discogs release link, or a direct image URL.')
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -2767,6 +2979,7 @@ class QtArtworkWindow(QMainWindow):
         self.approval_worker: Optional[ApprovalWorker] = None
         self.convert_worker: Optional[ConvertSaveWorker] = None
         self.search_worker: Optional[SearchWorker] = None
+        self.source_import_worker: Optional[SourceUrlImportWorker] = None
         self.album_rescan_worker: Optional[AlbumRescanWorker] = None
         self.locate_folder_worker: Optional[LocateAlbumFolderWorker] = None
         self.deep_check_worker: Optional[AlbumDeepCheckWorker] = None
@@ -3032,6 +3245,8 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu = QMenu(self)
         self.import_action = QAction(_line_icon('folder'), 'Import Image...', self)
         self.import_action.triggered.connect(self.import_image_for_current_album)
+        self.import_url_action = QAction(_line_icon('link'), 'Import From URL...', self)
+        self.import_url_action.triggered.connect(self.import_artwork_from_url)
         self.google_action = QAction(_line_icon('search'), 'Open Google Images', self)
         self.google_action.triggered.connect(self.open_google_images_for_current_album)
         self.choose_release_action = QAction(_line_icon('search'), 'Choose Release', self)
@@ -3078,6 +3293,7 @@ class QtArtworkWindow(QMainWindow):
 
         self.more_menu.addSection('Artwork')
         self.more_menu.addAction(self.import_action)
+        self.more_menu.addAction(self.import_url_action)
         self.more_menu.addAction(self.choose_release_action)
         self.more_menu.addAction(self.search_more_action)
         self.more_menu.addAction(self.google_action)
@@ -3716,7 +3932,7 @@ class QtArtworkWindow(QMainWindow):
         if cand.get('score') is not None:
             meta = (meta + ' - ' if meta else '') + f"{int(cand.get('score') or 0)}/100"
         self.candidate_panel.set_image(cand.get('image_path'), meta)
-        self.open_source_action.setEnabled(bool(_text(cand.get('source_url'))))
+        self.open_source_action.setEnabled(bool(self.source_page_url_from_candidate(cand)))
         self._render_details(cand)
         self._refresh_action_states()
 
@@ -3729,6 +3945,31 @@ class QtArtworkWindow(QMainWindow):
         if 0 <= row < len(self.current_candidates):
             return self.current_candidates[row]
         return None
+
+    def source_page_url_from_candidate(self, candidate: Optional[Dict[str, Any]]) -> str:
+        if not candidate:
+            return ''
+        meta = candidate.get('source_meta_json') if isinstance(candidate.get('source_meta_json'), dict) else {}
+        if not meta and isinstance(candidate.get('source_meta'), dict):
+            meta = candidate.get('source_meta') or {}
+        source_page = _text(meta.get('source_page') if isinstance(meta, dict) else '')
+        if source_page:
+            return source_page
+        source = _text(candidate.get('source')).lower()
+        release_id = _text(candidate.get('release_mbid')).strip()
+        if source == 'musicbrainz' and release_id:
+            return f'https://musicbrainz.org/release/{release_id}'
+        if source == 'discogs' and release_id:
+            return f'https://www.discogs.com/release/{release_id}'
+        if source in {'itunes', 'apple / itunes'} and release_id:
+            apple_id = release_id.split(':', 1)[1] if release_id.startswith('itunes:') else release_id
+            if apple_id:
+                return f'https://music.apple.com/album/{apple_id}'
+        if source == 'deezer' and release_id:
+            deezer_id = release_id.split(':', 1)[1] if release_id.startswith('deezer:') else release_id
+            if deezer_id:
+                return f'https://www.deezer.com/album/{deezer_id}'
+        return _text(candidate.get('source_url'))
 
     def _album_to_search_info(self, album: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not album:
@@ -3788,7 +4029,7 @@ class QtArtworkWindow(QMainWindow):
                 f"Release: {_text(candidate.get('release_title'), '-')}",
                 f"Size: {_text(candidate.get('width'), '?')} x {_text(candidate.get('height'), '?')}",
                 f"Score: {int(candidate.get('score') or 0)}/100",
-                f"Source page: {_text(candidate.get('source_url'), '-')}",
+                f"Source page: {_text(self.source_page_url_from_candidate(candidate), '-')}",
             ])
             if warnings:
                 lines.append('Warnings: ' + '; '.join(_text(w) for w in warnings if _text(w)))
@@ -3840,13 +4081,14 @@ class QtArtworkWindow(QMainWindow):
         approval_busy = self.approval_worker is not None and self.approval_worker.isRunning()
         convert_busy = self.convert_worker is not None and self.convert_worker.isRunning()
         search_busy = self.search_worker is not None and self.search_worker.isRunning()
+        source_import_busy = self.source_import_worker is not None and self.source_import_worker.isRunning()
         rescan_busy = self.album_rescan_worker is not None and self.album_rescan_worker.isRunning()
         locate_busy = self.locate_folder_worker is not None and self.locate_folder_worker.isRunning()
         deep_check_busy = self.deep_check_worker is not None and self.deep_check_worker.isRunning()
         repair_busy = self.repair_worker is not None and self.repair_worker.isRunning()
         queue_repair_busy = self.queue_repair_worker is not None and self.queue_repair_worker.isRunning()
         undo_busy = self.undo_worker is not None and self.undo_worker.isRunning()
-        busy = approval_busy or convert_busy or search_busy or rescan_busy or locate_busy or deep_check_busy or repair_busy or queue_repair_busy or undo_busy
+        busy = approval_busy or convert_busy or search_busy or source_import_busy or rescan_busy or locate_busy or deep_check_busy or repair_busy or queue_repair_busy or undo_busy
         album = self.current_album or {}
         bucket = self._album_bucket(album) if album else ''
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
@@ -3871,6 +4113,7 @@ class QtArtworkWindow(QMainWindow):
         self.skip_btn.setEnabled(can_use_active_album)
         self.backup_before_embed_action.setEnabled(not busy)
         self.import_action.setEnabled(can_use_active_album)
+        self.import_url_action.setEnabled(can_use_active_album)
         self.more_btn.setEnabled(not busy)
         self.google_action.setEnabled(bool(has_album_key and not busy))
         self.choose_release_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'} and not busy))
@@ -3890,7 +4133,7 @@ class QtArtworkWindow(QMainWindow):
         self.ignore_action.setEnabled(can_use_active_album)
         self.rework_action.setEnabled(can_rework)
         self.open_folder_action.setEnabled(bool(self.current_album and _text(self.current_album.get('album_path'))))
-        self.open_source_action.setEnabled(bool(has_candidate and _text((self._selected_candidate() or {}).get('source_url'))))
+        self.open_source_action.setEnabled(bool(has_candidate and self.source_page_url_from_candidate(self._selected_candidate())))
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt naming
         try:
@@ -5350,12 +5593,80 @@ class QtArtworkWindow(QMainWindow):
         self.statusBar().showMessage('Imported artwork option.')
         self._refresh_action_states()
 
+    def import_artwork_from_url(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        if not album_key:
+            return
+        if self.source_import_worker is not None and self.source_import_worker.isRunning():
+            return
+        try:
+            fresh = db.get_album(album_key) or {}
+        except Exception:
+            fresh = {}
+        info = self._album_to_search_info({**album, **fresh, 'album_path': album.get('album_path') or fresh.get('album_path')})
+        if not info or not _text(info.get('album_path')):
+            QMessageBox.warning(self, 'Cannot import from URL', 'Select an album with a known folder first.')
+            return
+        value, ok = QInputDialog.getText(
+            self,
+            'Import Artwork From URL',
+            'Paste a Deezer, Apple/iTunes, MusicBrainz, Discogs release link, or a direct image URL:',
+        )
+        if not ok or not _text(value):
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        self.approval_status.setText('Importing artwork from URL...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Importing artwork from URL...')
+        worker = SourceUrlImportWorker(info, _text(value), self.settings, self)
+        worker.completed.connect(self._source_url_import_completed)
+        worker.failed.connect(self._source_url_import_failed)
+        worker.finished.connect(lambda w=worker: self._source_url_import_worker_finished(w))
+        self.source_import_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
+    def _source_url_import_completed(self, result: object) -> None:
+        result = dict(result or {})
+        album_key = _text(result.get('album_key'))
+        added = int(result.get('added') or 0)
+        source = _text(result.get('source'), 'source URL')
+        self.approval_progress.setVisible(False)
+        self.reload_queue(select_first=False)
+        if added:
+            self.queue_filter = 'Review'
+            self._set_queue_filter('Review')
+            if album_key:
+                self._select_album_key(album_key, fallback_first=True)
+        elif album_key:
+            self._select_album_key(album_key, fallback_first=True)
+        message = f'Added {added} artwork option(s) from {source}.' if added else f'{source} was recognised, but no suitable artwork met your size rules.'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        self._refresh_action_states()
+
+    def _source_url_import_failed(self, message: str) -> None:
+        message = _text(message, 'Source URL import failed.')
+        self.approval_progress.setVisible(False)
+        self.approval_status.setText(message)
+        self.statusBar().showMessage('Source URL import failed')
+        QMessageBox.warning(self, 'Source URL import failed', message)
+        self._refresh_action_states()
+
+    def _source_url_import_worker_finished(self, worker: SourceUrlImportWorker) -> None:
+        if self.source_import_worker is worker:
+            self.source_import_worker = None
+        self._refresh_action_states()
+
     def open_source_page(self) -> None:
-        row = self.candidate_list.currentRow()
-        if 0 <= row < len(self.current_candidates):
-            url = _text(self.current_candidates[row].get('source_url'))
-            if url:
-                webbrowser.open(url)
+        url = self.source_page_url_from_candidate(self._selected_candidate())
+        if url:
+            webbrowser.open(url)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         if self.scan_dialog is not None:
@@ -5370,6 +5681,10 @@ class QtArtworkWindow(QMainWindow):
             return
         if self.locate_folder_worker is not None and self.locate_folder_worker.isRunning():
             QMessageBox.information(self, 'Folder update still running', 'Wait for the album folder update to finish before closing Artwork Manager.')
+            event.ignore()
+            return
+        if self.source_import_worker is not None and self.source_import_worker.isRunning():
+            QMessageBox.information(self, 'URL import still running', 'Wait for the artwork URL import to finish before closing Artwork Manager.')
             event.ignore()
             return
         if self.deep_check_worker is not None and self.deep_check_worker.isRunning():
@@ -5424,6 +5739,11 @@ class QtArtworkWindow(QMainWindow):
         if self.locate_folder_worker is not None:
             try:
                 self.locate_folder_worker.wait(500)
+            except Exception:
+                pass
+        if self.source_import_worker is not None:
+            try:
+                self.source_import_worker.wait(500)
             except Exception:
                 pass
         if self.repair_worker is not None:
