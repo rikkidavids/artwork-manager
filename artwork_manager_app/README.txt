@@ -1,5 +1,6 @@
-Build 4.97 — Qt queue column polish
+Build 4.98 — Qt natural column resizing
 
+- Queue column resizing now takes or gives space from columns to the right of the dragged column, keeping Opts pinned and avoiding dead space.
 - Reordered queue chips to All, Needs Work, Review, Done.
 - The queue table now fills the available width so the right edge of Opts stays pinned to the table edge after column resizing.
 - When the last item in Review is handled, the Qt app now moves to Needs Work automatically if more work is waiting.

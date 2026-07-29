@@ -152,7 +152,7 @@ QUEUE_COLUMN_MIN_WIDTHS = {
     'status': 82,
     'artist': 90,
     'album': 110,
-    'current': 96,
+    'current': 76,
     'candidates': 38,
 }
 QUEUE_COLUMN_ALIASES = {
@@ -3751,45 +3751,68 @@ class QtArtworkWindow(QMainWindow):
         finally:
             self._restoring_queue_columns = False
 
-    def _queue_column_resized(self, _logical_index: int, _old_size: int, _new_size: int) -> None:
+    def _queue_column_resized(self, logical_index: int, old_size: int, new_size: int) -> None:
         if self._restoring_queue_columns:
             return
-        self._rebalance_queue_columns_after_resize(_logical_index)
+        self._rebalance_queue_columns_after_resize(logical_index, old_size, new_size)
         self.queue_column_save_timer.start(350)
 
-    def _rebalance_queue_columns_after_resize(self, resized_col: int) -> None:
+    def _rebalance_queue_columns_after_resize(self, resized_col: int, old_size: int, new_size: int) -> None:
         available = max(0, int(self.table.viewport().width()) - 2)
         if available <= 80:
             return
-        widths = {
-            name: max(QUEUE_COLUMN_MIN_WIDTHS.get(name, 40), int(self.table.columnWidth(col)))
-            for col, name in enumerate(QUEUE_COLUMNS)
-        }
-        delta = available - sum(widths.values())
-        if delta == 0:
+        if not (0 <= resized_col < len(QUEUE_COLUMNS)):
             return
-        resized_name = QUEUE_COLUMNS[resized_col] if 0 <= resized_col < len(QUEUE_COLUMNS) else ''
-        if delta > 0:
-            fill_name = 'album' if resized_name != 'album' else 'artist'
-            widths[fill_name] = widths.get(fill_name, 0) + delta
-        else:
-            excess = abs(delta)
-            for name in ('album', 'artist', 'current', 'status', 'candidates'):
-                if name == resized_name:
-                    continue
+        change = int(new_size) - int(old_size)
+        if change == 0:
+            return
+        widths = [
+            max(QUEUE_COLUMN_MIN_WIDTHS.get(name, 40), int(self.table.columnWidth(col)))
+            for col, name in enumerate(QUEUE_COLUMNS)
+        ]
+        receiver_cols = list(range(resized_col + 1, len(QUEUE_COLUMNS)))
+        if not receiver_cols:
+            receiver_cols = list(range(resized_col - 1, -1, -1))
+        if change > 0:
+            remaining = change
+            applied = 0
+            for col in receiver_cols:
+                name = QUEUE_COLUMNS[col]
                 minimum = QUEUE_COLUMN_MIN_WIDTHS.get(name, 40)
-                reducible = max(0, widths.get(name, minimum) - minimum)
-                take = min(excess, reducible)
-                widths[name] -= take
-                excess -= take
-                if excess <= 0:
+                reducible = max(0, widths[col] - minimum)
+                take = min(remaining, reducible)
+                widths[col] -= take
+                remaining -= take
+                applied += take
+                if remaining <= 0:
                     break
-            if excess > 0:
-                return
+            widths[resized_col] = max(QUEUE_COLUMN_MIN_WIDTHS.get(QUEUE_COLUMNS[resized_col], 40), int(old_size) + applied)
+        else:
+            widths[receiver_cols[0]] += abs(change)
+            widths[resized_col] = max(QUEUE_COLUMN_MIN_WIDTHS.get(QUEUE_COLUMNS[resized_col], 40), int(new_size))
+        final_delta = available - sum(widths)
+        if final_delta > 0:
+            widths[receiver_cols[0]] += final_delta
+        elif final_delta < 0:
+            remaining = abs(final_delta)
+            for col in receiver_cols:
+                name = QUEUE_COLUMNS[col]
+                minimum = QUEUE_COLUMN_MIN_WIDTHS.get(name, 40)
+                reducible = max(0, widths[col] - minimum)
+                take = min(remaining, reducible)
+                widths[col] -= take
+                remaining -= take
+                if remaining <= 0:
+                    break
+            if remaining > 0:
+                name = QUEUE_COLUMNS[resized_col]
+                minimum = QUEUE_COLUMN_MIN_WIDTHS.get(name, 40)
+                take = min(remaining, max(0, widths[resized_col] - minimum))
+                widths[resized_col] -= take
         self._restoring_queue_columns = True
         try:
-            for col, name in enumerate(QUEUE_COLUMNS):
-                self.table.setColumnWidth(col, widths.get(name, DEFAULT_QUEUE_COLUMN_WIDTHS.get(name, 100)))
+            for col, width in enumerate(widths):
+                self.table.setColumnWidth(col, width)
         finally:
             self._restoring_queue_columns = False
 
