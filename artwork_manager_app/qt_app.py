@@ -3623,6 +3623,22 @@ class QtArtworkWindow(QMainWindow):
                 return key
         return ''
 
+    def _move_from_empty_review_to_needs_work(self) -> bool:
+        if self._normalise_queue_filter(self.queue_filter) != 'Review':
+            return False
+        counts = self._queue_bucket_counts()
+        if counts.get('Review', 0) or not counts.get('Needs Work', 0):
+            return False
+        self.queue_filter = 'Needs Work'
+        self.apply_filters()
+        if not self.visible_albums:
+            self.queue_filter = 'Review'
+            self.apply_filters()
+            return False
+        self._schedule_queue_filter_state_save()
+        self.statusBar().showMessage('Review is clear. Moved to Needs Work.')
+        return True
+
     def _searchable_batch_albums(self) -> List[Dict[str, Any]]:
         if not self.visible_albums:
             return []
@@ -5791,12 +5807,16 @@ class QtArtworkWindow(QMainWindow):
 
     def _select_next_actionable_row(self, *, start_row: int = 0) -> bool:
         if not self.visible_albums:
+            if self._move_from_empty_review_to_needs_work():
+                return True
             return False
         start = max(0, min(int(start_row or 0), len(self.visible_albums) - 1))
         for offset in range(len(self.visible_albums)):
             row = (start + offset) % len(self.visible_albums)
             if self._album_bucket(self.visible_albums[row]) in ACTIONABLE_BUCKETS:
                 return self._select_visible_row(row)
+        if self._move_from_empty_review_to_needs_work():
+            return True
         return self._select_visible_row(0)
 
     def open_album_folder(self) -> None:

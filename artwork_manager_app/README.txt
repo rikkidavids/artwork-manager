@@ -1,5 +1,6 @@
-Build 4.95 — Qt fixed review widths
+Build 4.96 — Qt review handoff
 
+- When the last item in Review is handled, the Qt app now moves to Needs Work automatically if more work is waiting.
 - Fixed long album/file-path text in the right-hand artwork panels so it truncates instead of squeezing the queue panel.
 - Added multi-select to the Qt queue, with Album Tools > Selection actions for Search Selected, Convert/Save Selected, Mark Selected Good, and Ignore Selected.
 - The queue count now quietly shows how many albums are selected when using batch actions.
