@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import webbrowser
+from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -2992,6 +2993,7 @@ class QtArtworkWindow(QMainWindow):
         self.convert_batch_label = 'Convert/Save Next'
         self.last_search_log: List[str] = []
         self.last_search_album_key = ''
+        self.search_batch_label = 'Search'
         self.pending_approval_row = 0
         self._restoring_queue_controls = False
         self._restoring_queue_columns = False
@@ -3560,7 +3562,8 @@ class QtArtworkWindow(QMainWindow):
         self.album_subtitle.setText('')
         self.current_panel.set_placeholder('No artwork')
         self.candidate_panel.set_placeholder('No artwork')
-        self.details.setPlainText('')
+        if hasattr(self, 'details'):
+            self.details.setHtml(self._details_document('<p class="empty">Select an album to review.</p>'))
         self.details.setPlaceholderText('Select an album to review.')
         self.open_folder_action.setEnabled(False)
         self.open_source_action.setEnabled(False)
@@ -3586,7 +3589,14 @@ class QtArtworkWindow(QMainWindow):
         elif self.search_edit.text().strip():
             message = 'No albums match this search.'
         else:
-            message = f'No albums in {self._normalise_queue_filter(self.queue_filter)}.'
+            counts = self._queue_bucket_counts()
+            selected_filter = self._normalise_queue_filter(self.queue_filter)
+            if selected_filter == 'Review' and counts.get('Needs Work', 0):
+                message = f'Review is clear. {int(counts.get("Needs Work", 0)):,} album(s) still need work.'
+            elif selected_filter == 'Needs Work' and counts.get('Review', 0):
+                message = f'Needs Work is clear. {int(counts.get("Review", 0)):,} album(s) are ready to review.'
+            else:
+                message = f'No albums in {selected_filter}.'
         self.queue_empty_label.setText(message)
         self.queue_empty_label.setVisible(True)
 
@@ -3995,7 +4005,7 @@ class QtArtworkWindow(QMainWindow):
         self.current_panel.set_placeholder('Loading...', 'Reading embedded artwork')
         self._load_current_art(album)
         self._load_candidates(album)
-        self._render_details()
+        self._render_details(self._selected_candidate())
         self._refresh_action_states()
 
     def _load_current_art(self, album: Dict[str, Any]) -> None:
@@ -4084,6 +4094,7 @@ class QtArtworkWindow(QMainWindow):
             self.candidate_widgets.append(widget)
         if self.current_candidates:
             self.candidate_list.setCurrentRow(0)
+            self._select_candidate(0)
         else:
             self.candidate_panel.set_placeholder('No candidate artwork')
         self._refresh_action_states()
@@ -4163,70 +4174,109 @@ class QtArtworkWindow(QMainWindow):
     def _render_details(self, candidate: Optional[Dict[str, Any]] = None) -> None:
         album = self.current_album or {}
         status, reason = self._album_status_reason(album) if album else ('', '')
-        lines = []
-        if album:
-            notes = album.get('notes_json') if isinstance(album.get('notes_json'), dict) else {}
-            deep = notes.get('deep_file_check') if isinstance(notes.get('deep_file_check'), dict) else {}
-            lines.extend([
-                f"Status: {workflow_bucket_for_status(status)}",
-                f"Why: {reason or _text(status, 'No status recorded')}",
-                f"Current size: {_album_size(album)}",
-                f"Options: {int(album.get('candidate_count') or 0)}",
-                '',
-                'Album folder:',
-                _text(album.get('album_path'), '-'),
-            ])
-            if deep:
-                lines.extend([
-                    '',
-                    'Deep check:',
-                    _deep_check_summary_text(deep),
-                ])
-                first_issue = _text(deep.get('first_issue_file') or deep.get('first_non_square_file'))
-                if first_issue:
-                    lines.append(f'First issue: {first_issue}')
-                problem_files = notes.get('last_problem_files') if isinstance(notes.get('last_problem_files'), dict) else {}
-                if problem_files.get('problem_count'):
-                    lines.append(f"Problem files: {int(problem_files.get('problem_count') or 0)}")
+        if not album:
+            self.details.setHtml(self._details_document('<p class="empty">Select an album to review.</p>'))
+            return
+
+        notes = album.get('notes_json') if isinstance(album.get('notes_json'), dict) else {}
+        if not notes and isinstance(album.get('notes'), dict):
+            notes = album.get('notes') or {}
+        deep = notes.get('deep_file_check') if isinstance(notes.get('deep_file_check'), dict) else {}
+        bucket = workflow_bucket_for_status(status)
+        sections = [
+            self._details_section('Summary', [
+                ('Status', bucket),
+                ('Why', reason or _text(status, 'No status recorded')),
+                ('Options', f"{int(album.get('candidate_count') or 0)} saved"),
+            ]),
+            self._details_section('Current Artwork', [
+                ('Embedded size', _album_size(album)),
+                ('Deep check', _deep_check_summary_text(deep) if deep else 'Not run'),
+            ]),
+            self._details_section('Folder', [
+                ('Album folder', _text(album.get('album_path'), '-')),
+            ]),
+        ]
+        if deep:
+            deep_rows = []
+            first_issue = _text(deep.get('first_issue_file') or deep.get('first_non_square_file'))
+            if first_issue:
+                deep_rows.append(('First issue', first_issue))
+            problem_files = notes.get('last_problem_files') if isinstance(notes.get('last_problem_files'), dict) else {}
+            if problem_files.get('problem_count'):
+                deep_rows.append(('Problem files', str(int(problem_files.get('problem_count') or 0))))
+            if deep_rows:
+                sections.append(self._details_section('Deep Check', deep_rows))
         if candidate:
             warnings = candidate.get('warnings') or []
             if isinstance(warnings, str):
                 warnings = [warnings]
-            lines.extend([
-                '',
-                'Selected candidate:',
-                f"Source: {_text(candidate.get('source'), '-')}",
-                f"Release: {_text(candidate.get('release_title'), '-')}",
-                f"Size: {_text(candidate.get('width'), '?')} x {_text(candidate.get('height'), '?')}",
-                f"Score: {int(candidate.get('score') or 0)}/100",
-                f"Source page: {_text(self.source_page_url_from_candidate(candidate), '-')}",
-            ])
-            if warnings:
-                lines.append('Warnings: ' + '; '.join(_text(w) for w in warnings if _text(w)))
+            source_page = self.source_page_url_from_candidate(candidate)
+            candidate_rows = [
+                ('Source', _text(candidate.get('source'), '-')),
+                ('Release', _text(candidate.get('release_title'), '-')),
+                ('Size', f"{_text(candidate.get('width'), '?')} x {_text(candidate.get('height'), '?')}"),
+                ('Score', f"{int(candidate.get('score') or 0)}/100"),
+                ('Source page', 'Available' if source_page else '-'),
+            ]
+            clean_warnings = '; '.join(_text(w) for w in warnings if _text(w))
+            if clean_warnings:
+                candidate_rows.append(('Warnings', clean_warnings))
             summary = _text(candidate.get('score_summary'))
             if summary:
-                lines.append('Score summary: ' + summary)
+                candidate_rows.append(('Score summary', summary))
+            sections.append(self._details_section('Selected Candidate', candidate_rows))
+        elif self.current_candidates:
+            sections.append(self._details_section('Candidate', [('Selected', 'Choose an option to preview it.')]))
+        else:
+            sections.append(self._details_section('Candidate', [('Saved options', 'None yet.')]))
         if self.last_approval_result and album and self.last_approval_result.get('album_key') == album.get('album_key'):
-            lines.extend([
-                '',
-                'Last approval:',
-                _text(self.last_approval_result.get('final_reason'), '-'),
-                f"Files: {int(self.last_approval_result.get('updated_files') or 0)} / {int(self.last_approval_result.get('total_files') or 0)}",
-            ])
+            sections.append(self._details_section('Last Approval', [
+                ('Result', _text(self.last_approval_result.get('final_reason'), '-')),
+                ('Files', f"{int(self.last_approval_result.get('updated_files') or 0)} / {int(self.last_approval_result.get('total_files') or 0)}"),
+            ]))
         if self.last_convert_result and album and self.last_convert_result.get('album_key') == album.get('album_key'):
-            lines.extend([
-                '',
-                'Last Convert/Save:',
-                _text(self.last_convert_result.get('conversion_reason'), '-'),
-                f"Result: {_text(self.last_convert_result.get('final_bucket'), 'Done')} - {_text(self.last_convert_result.get('final_reason'), '-')}",
-                f"Artwork: {_text(self.last_convert_result.get('embedded_dimensions'), '-')}",
-            ])
+            sections.append(self._details_section('Last Convert/Save', [
+                ('Reason', _text(self.last_convert_result.get('conversion_reason'), '-')),
+                ('Result', f"{_text(self.last_convert_result.get('final_bucket'), 'Done')} - {_text(self.last_convert_result.get('final_reason'), '-')}"),
+                ('Artwork', _text(self.last_convert_result.get('embedded_dimensions'), '-')),
+            ]))
         if self.last_search_log and album and self.last_search_album_key == _text(album.get('album_key')):
-            recent = [_text(line) for line in self.last_search_log[-3:] if _text(line)]
+            recent = [_text(line) for line in self.last_search_log[-4:] if _text(line)]
             if recent:
-                lines.extend(['', 'Recent search:'])
-                lines.extend(recent)
-        self.details.setPlainText('\n'.join(lines))
+                sections.append(self._details_log_section('Recent Search', recent))
+        self.details.setHtml(self._details_document(''.join(sections)))
+
+    def _details_document(self, body: str) -> str:
+        return f"""
+        <html>
+        <head>
+            <style>
+                body {{ color: #1d1d1f; font-size: 13px; margin: 0; }}
+                .section {{ margin-bottom: 14px; }}
+                .title {{ color: #111827; font-size: 13px; font-weight: 700; margin-bottom: 6px; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                td {{ vertical-align: top; padding: 1px 0 5px 0; }}
+                td.label {{ color: #6b7280; width: 108px; padding-right: 12px; white-space: nowrap; }}
+                td.value {{ color: #1d1d1f; }}
+                .log {{ color: #374151; background: #f8fafc; border: 1px solid #edf0f5; border-radius: 4px; padding: 7px 8px; }}
+                .empty {{ color: #6b7280; }}
+            </style>
+        </head>
+        <body>{body}</body>
+        </html>
+        """
+
+    def _details_section(self, title: str, rows: List[tuple[str, Any]]) -> str:
+        row_html = ''.join(
+            f'<tr><td class="label">{escape(_text(label))}</td><td class="value">{escape(_text(value, "-"))}</td></tr>'
+            for label, value in rows
+        )
+        return f'<div class="section"><div class="title">{escape(_text(title))}</div><table>{row_html}</table></div>'
+
+    def _details_log_section(self, title: str, lines: List[str]) -> str:
+        body = '<br>'.join(escape(_text(line)) for line in lines if _text(line))
+        return f'<div class="section"><div class="title">{escape(_text(title))}</div><div class="log">{body}</div></div>'
 
     def _save_backup_preference(self, checked: Optional[bool] = None) -> None:
         try:
@@ -4401,6 +4451,7 @@ class QtArtworkWindow(QMainWindow):
             max_per_album,
             status_text=f'Searching providers for {artist} - {album}...',
             log_lines=[f'Searching: {artist} - {album}'],
+            batch_label='Find Artwork',
         )
 
     def search_more_for_current_album(self) -> None:
@@ -4430,14 +4481,16 @@ class QtArtworkWindow(QMainWindow):
                 f'Search More: {artist} - {album}',
                 f'Already saved: {existing}; target after this search: {target_total}',
             ],
+            batch_label='Search More',
         )
 
-    def _start_search_worker(self, infos: List[Dict[str, Any]], max_per_album: int, *, status_text: str, log_lines: List[str]) -> None:
+    def _start_search_worker(self, infos: List[Dict[str, Any]], max_per_album: int, *, status_text: str, log_lines: List[str], batch_label: str = 'Search') -> None:
         if self.search_worker is not None and self.search_worker.isRunning():
             return
         infos = [dict(info or {}) for info in (infos or []) if info and info.get('album_key') and info.get('album_path')]
         if not infos:
             return
+        self.search_batch_label = _text(batch_label, 'Search')
         self.last_search_album_key = _text(infos[0].get('album_key'))
         self.last_search_log = list(log_lines or [])
         self.approval_status.setText(status_text)
@@ -4475,6 +4528,7 @@ class QtArtworkWindow(QMainWindow):
         first = infos[0]
         first_label = f"{_text(first.get('artist'), 'Unknown Artist')} - {_text(first.get('album'), 'Unknown Album')}"
         self.last_search_album_key = _text(first.get('album_key'))
+        self.search_batch_label = 'Search Next'
         self.last_search_log = [f'Search Next: {len(infos)} album(s)', f'First: {first_label}']
         self.approval_status.setText(f'Searching next {len(infos)} album(s)...')
         self.approval_progress.setVisible(True)
@@ -4520,6 +4574,7 @@ class QtArtworkWindow(QMainWindow):
             max_per_album,
             status_text=f'Searching {len(infos)} selected album(s)...',
             log_lines=[f'Search Selected: {len(infos)} album(s)'],
+            batch_label='Search Selected',
         )
 
     def stop_search(self) -> None:
@@ -4553,6 +4608,32 @@ class QtArtworkWindow(QMainWindow):
             dims = f" {cand.get('width')} x {cand.get('height')}"
         self.approval_status.setText(f'Saved {source}{dims}')
 
+    def _search_result_summary(self, result: Dict[str, Any]) -> str:
+        status_counts = result.get('status_counts') if isinstance(result.get('status_counts'), dict) else {}
+        if not status_counts:
+            return ''
+        buckets: Dict[str, int] = {}
+        for status, count in status_counts.items():
+            try:
+                count = int(count or 0)
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+            bucket = workflow_bucket_for_status(_text(status))
+            buckets[bucket] = buckets.get(bucket, 0) + count
+        ready = int(buckets.get('Review', 0))
+        needs = sum(int(buckets.get(bucket, 0)) for bucket in WORK_BUCKETS)
+        done = sum(int(buckets.get(bucket, 0)) for bucket in DONE_BUCKETS)
+        parts = []
+        if ready:
+            parts.append(f'{ready} ready for Review')
+        if needs:
+            parts.append(f'{needs} still need work')
+        if done:
+            parts.append(f'{done} Done')
+        return ', '.join(parts)
+
     def _search_completed(self, result: object) -> None:
         result = dict(result or {})
         self.approval_progress.setVisible(False)
@@ -4560,13 +4641,17 @@ class QtArtworkWindow(QMainWindow):
         stopped = bool(result.get('stopped'))
         album_count = int(result.get('album_count') or 1)
         album_keys = [_text(key) for key in (result.get('album_keys') or []) if _text(key)]
+        search_label = _text(getattr(self, 'search_batch_label', ''), 'Search')
+        result_summary = self._search_result_summary(result)
         if album_count > 1:
             if stopped:
-                message = f'Search Next stopped after saving {saved} option(s).'
+                message = f'{search_label} stopped after saving {saved} option(s).'
             elif saved:
-                message = f'Search Next found {saved} new option(s) across {album_count} album(s).'
+                message = f'{search_label} saved {saved} new option(s) across {album_count} album(s).'
             else:
-                message = 'Search Next finished. No new artwork options found.'
+                message = f'{search_label} finished. No new artwork options saved.'
+            if result_summary:
+                message += f' {result_summary}.'
         elif stopped:
             message = f'Search stopped after saving {saved} option(s).'
         elif saved:

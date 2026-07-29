@@ -1,5 +1,8 @@
-Build 4.98 — Qt natural column resizing
+Build 4.99 — Qt cleaner review flow
 
+- Reworked the Qt details pane into clean Summary, Current Artwork, Folder, Candidate, and recent-action sections.
+- Search Next/Search Selected completion now explains how many albums are ready for Review, still need work, or are Done.
+- Empty queue views now give better workflow hints, such as when Review is clear but Needs Work still has albums.
 - Queue column resizing now takes or gives space from columns to the right of the dragged column, keeping Opts pinned and avoiding dead space.
 - Reordered queue chips to All, Needs Work, Review, Done.
 - The queue table now fills the available width so the right edge of Opts stays pinned to the table edge after column resizing.
