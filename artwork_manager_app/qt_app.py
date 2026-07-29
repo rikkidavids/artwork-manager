@@ -68,8 +68,8 @@ from .config import (
     save_settings,
 )
 from .review_queue import build_candidates, google_images_url, manual_import
-from .scanner import embedded_artwork, scan_library, write_low_res_csv
-from .state import evaluate_album_record, workflow_bucket_for_status
+from .scanner import analyze_album_folder, embedded_artwork, inspect_album_identity, scan_library, write_low_res_csv
+from .state import evaluate_album_record, evaluate_album_state, workflow_bucket_for_status
 from .utils import open_path
 
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
@@ -309,6 +309,14 @@ def _first_music_file(album: Dict[str, Any]) -> str:
     return ''
 
 
+def _library_root_for_album_path(album_path: str) -> str:
+    path = Path(album_path).expanduser()
+    try:
+        return str(path.parent.parent) if path.parent and path.parent.parent else str(path.parent)
+    except Exception:
+        return str(path.parent)
+
+
 class CurrentArtWorker(QThread):
     loaded = Signal(str, object, object, str)
 
@@ -407,6 +415,94 @@ class SearchWorker(QThread):
                 'saved': saved,
                 'stopped': self.stop_event.is_set(),
                 'status_counts': status_counts,
+            })
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AlbumRescanWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, album: Dict[str, Any], settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.album = dict(album or {})
+        self.settings = dict(settings or {})
+
+    def run(self) -> None:
+        try:
+            album_path = _text(self.album.get('album_path'))
+            if not album_path or not os.path.isdir(album_path):
+                raise ValueError('The selected album folder could not be found.')
+            try:
+                names = sorted(os.listdir(album_path), key=lambda item: item.lower())
+            except Exception as exc:
+                raise ValueError(f'Could not read the selected album folder: {exc}') from exc
+            music = [
+                name for name in names
+                if os.path.isfile(os.path.join(album_path, name)) and name.lower().endswith(MUSIC_EXTENSIONS)
+            ]
+            if not music:
+                self.completed.emit({
+                    'album_key': _text(self.album.get('album_key')),
+                    'message': 'No supported music files were found in the selected album folder.',
+                    'status': '',
+                })
+                return
+
+            library_root = _library_root_for_album_path(album_path)
+            identity = inspect_album_identity(album_path, library_root, music)
+            row = analyze_album_folder(
+                album_path,
+                library_root,
+                include_missing=True,
+                music_files=music,
+                identity=identity,
+                force_deep_check=False,
+            )
+            if row:
+                artist, album_name, width, height, example, album_path2, album_key, identity = row
+                width_value = None if width == 'Missing' else width
+                height_value = None if height == 'Missing' else height
+                try:
+                    candidate_count = len(db.load_candidates_for_album(album_key, include_rejected=False))
+                except Exception:
+                    candidate_count = 0
+                status, status_reason = evaluate_album_state(
+                    width_value,
+                    height_value,
+                    identity.get('notes') or {},
+                    current_status=(db.get_album(album_key) or {}).get('status') or 'needs_review',
+                    candidate_count=candidate_count,
+                    preserve_user_terminal=False,
+                    settings=self.settings,
+                )
+                identity = dict(identity)
+                notes = dict(identity.get('notes') or {})
+                notes['state_evaluation'] = {'status': status, 'reason': status_reason}
+                identity['notes'] = notes
+                db.upsert_album(
+                    album_key,
+                    artist,
+                    album_name,
+                    album_path2,
+                    status=status,
+                    width=width_value,
+                    height=height_value,
+                    example_file=example,
+                    meta=identity,
+                )
+            else:
+                fresh = db.find_album_by_path(album_path) or {}
+                album_key = _text(fresh.get('album_key') or self.album.get('album_key'))
+                status = _text(fresh.get('status'), 'already_good')
+                status_reason = 'current embedded artwork meets the configured rules'
+
+            self.completed.emit({
+                'album_key': album_key,
+                'status': status,
+                'reason': status_reason,
+                'message': 'Album refreshed from disk.',
             })
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -984,6 +1080,7 @@ class QtArtworkWindow(QMainWindow):
         self.current_art_workers: List[CurrentArtWorker] = []
         self.approval_worker: Optional[ApprovalWorker] = None
         self.search_worker: Optional[SearchWorker] = None
+        self.album_rescan_worker: Optional[AlbumRescanWorker] = None
         self.scan_dialog: Optional[ScanDialog] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
         self.last_search_log: List[str] = []
@@ -1230,6 +1327,8 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu = QMenu(self)
         self.google_action = QAction(_line_icon('search'), 'Open Google Images', self)
         self.google_action.triggered.connect(self.open_google_images_for_current_album)
+        self.refresh_album_action = QAction(_line_icon('refresh'), 'Refresh From Disk', self)
+        self.refresh_album_action.triggered.connect(self.refresh_current_album_from_disk)
         self.mark_good_action = QAction(_line_icon('check'), 'Mark Current Artwork Good', self)
         self.mark_good_action.triggered.connect(self.mark_current_album_good)
         self.ignore_action = QAction(_line_icon('stop'), 'Ignore Album', self)
@@ -1237,6 +1336,7 @@ class QtArtworkWindow(QMainWindow):
         self.rework_action = QAction(_line_icon('refresh'), 'Rework Album', self)
         self.rework_action.triggered.connect(self.rework_current_album)
         self.more_menu.addAction(self.google_action)
+        self.more_menu.addAction(self.refresh_album_action)
         self.more_menu.addSeparator()
         self.more_menu.addAction(self.mark_good_action)
         self.more_menu.addAction(self.ignore_action)
@@ -1895,7 +1995,8 @@ class QtArtworkWindow(QMainWindow):
         has_candidate = self._selected_candidate() is not None
         approval_busy = self.approval_worker is not None and self.approval_worker.isRunning()
         search_busy = self.search_worker is not None and self.search_worker.isRunning()
-        busy = approval_busy or search_busy
+        rescan_busy = self.album_rescan_worker is not None and self.album_rescan_worker.isRunning()
+        busy = approval_busy or search_busy or rescan_busy
         album = self.current_album or {}
         bucket = self._album_bucket(album) if album else ''
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
@@ -1917,6 +2018,7 @@ class QtArtworkWindow(QMainWindow):
         self.import_btn.setEnabled(can_use_active_album)
         self.more_btn.setEnabled(bool(has_album_key and not busy))
         self.google_action.setEnabled(bool(has_album_key and not busy))
+        self.refresh_album_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.mark_good_action.setEnabled(can_use_active_album)
         self.ignore_action.setEnabled(can_use_active_album)
         self.rework_action.setEnabled(can_rework)
@@ -2341,6 +2443,63 @@ class QtArtworkWindow(QMainWindow):
         self.statusBar().showMessage(message)
         self._refresh_action_states()
 
+    def refresh_current_album_from_disk(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        album_path = _text(album.get('album_path'))
+        if not album_key or not album_path:
+            return
+        if self.album_rescan_worker is not None and self.album_rescan_worker.isRunning():
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        label = self._album_display_name(album)
+        self.approval_status.setText(f'Refreshing from disk: {label}...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Refreshing selected album from disk...')
+        worker = AlbumRescanWorker(album, self.settings, self)
+        worker.completed.connect(self._album_rescan_completed)
+        worker.failed.connect(self._album_rescan_failed)
+        worker.finished.connect(lambda w=worker: self._album_rescan_worker_finished(w))
+        self.album_rescan_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
+    def _album_rescan_completed(self, result: object) -> None:
+        result = dict(result or {})
+        self.approval_progress.setVisible(False)
+        album_key = _text(result.get('album_key'))
+        message = _text(result.get('message'), 'Album refreshed from disk.')
+        if result.get('reason'):
+            message = f"{message} {result.get('reason')}"
+        self.reload_queue(select_first=False)
+        if album_key and not self._select_album_key(album_key, fallback_first=False):
+            target_filter = self._queue_filter_for_album_key(album_key)
+            if target_filter:
+                self.queue_filter = target_filter
+                self.apply_filters()
+                self._schedule_queue_filter_state_save()
+                self._select_album_key(album_key, fallback_first=True)
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        self._refresh_action_states()
+
+    def _album_rescan_failed(self, message: str) -> None:
+        self.approval_progress.setVisible(False)
+        message = _text(message, 'Album refresh failed.')
+        self.approval_status.setText(message)
+        self.statusBar().showMessage('Album refresh failed')
+        QMessageBox.warning(self, 'Refresh from disk failed', message)
+        self._refresh_action_states()
+
+    def _album_rescan_worker_finished(self, worker: AlbumRescanWorker) -> None:
+        if self.album_rescan_worker is worker:
+            self.album_rescan_worker = None
+        self._refresh_action_states()
+
     def open_google_images_for_current_album(self) -> None:
         album = self.current_album or {}
         album_key = _text(album.get('album_key'))
@@ -2518,6 +2677,10 @@ class QtArtworkWindow(QMainWindow):
                 QMessageBox.information(self, 'Scan still running', 'Stop the scan before closing Artwork Manager.')
                 event.ignore()
                 return
+        if self.album_rescan_worker is not None and self.album_rescan_worker.isRunning():
+            QMessageBox.information(self, 'Refresh still running', 'Wait for the selected album refresh to finish before closing Artwork Manager.')
+            event.ignore()
+            return
         if self.queue_filter_save_timer.isActive():
             self.queue_filter_save_timer.stop()
             self._save_queue_filter_state()
