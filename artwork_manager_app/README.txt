@@ -1,5 +1,6 @@
-Build 5.01 — Qt empty options hint
+Build 5.02 — Qt cleaner action row
 
+- The bottom action row now hides candidate-only and inactive actions until they are useful.
 - Added a calm empty-state card to the artwork options list when an album has no saved candidate covers.
 - Simplified the Qt details panel into plain-language state, a short explanation, a few facts, and the next useful action.
 - Removed folder paths and raw deep-check wording from the main review details panel.
