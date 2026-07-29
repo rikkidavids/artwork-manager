@@ -1,4 +1,4 @@
-Build 4.77 — Qt NAS worker checks
+Build 4.78 — Qt choose release
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -36,6 +36,7 @@ Build 4.77 — Qt NAS worker checks
 - Added Qt Show Problem Files in the More menu, using Mac-local or NAS-worker deep checks to list tracks that are missing, undersized, not square, unreadable, or not baseline JPEG.
 - The Qt details pane now shows saved Deep Check summaries and problem-file counts for the selected album.
 - Added Qt NAS Worker Test and Worker Status controls inside Settings, with background checks and concise compatibility/status reporting.
+- Added Qt Choose Release in the More menu, allowing exact MusicBrainz, Deezer, iTunes, or Discogs release artwork to be imported into the normal Review queue.
 
 Qt review branch
 

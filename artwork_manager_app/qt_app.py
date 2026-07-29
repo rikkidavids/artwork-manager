@@ -11,6 +11,7 @@ import threading
 import webbrowser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
@@ -69,6 +70,10 @@ from .config import (
 )
 from .review_queue import build_candidates, google_images_url, manual_import
 from .remote_worker import check_worker, deep_check_album_remote, worker_enabled_for_path, worker_status, worker_update_hint
+from .providers.deezer import DeezerProvider
+from .providers.discogs import DiscogsProvider
+from .providers.itunes import ITunesProvider
+from .providers.musicbrainz import MusicBrainzProvider
 from .scanner import (
     _deep_check_album_files,
     analyze_album_folder,
@@ -235,6 +240,61 @@ def _deep_check_summary_text(deep: Dict[str, Any]) -> str:
     if checked:
         return f'{checked} file(s) OK'
     return 'No supported music files checked'
+
+
+def _musicbrainz_artist(raw: Dict[str, Any]) -> str:
+    try:
+        return ' / '.join(
+            _text(credit.get('artist', {}).get('name'))
+            for credit in raw.get('artist-credit', [])
+            if isinstance(credit, dict) and isinstance(credit.get('artist'), dict)
+        )
+    except Exception:
+        return ''
+
+
+def _release_row_values(item: Dict[str, Any]) -> List[str]:
+    source = _text(item.get('source'), 'Source')
+    raw = item.get('raw') if isinstance(item.get('raw'), dict) else {}
+    if source == 'MusicBrainz':
+        title = _text(raw.get('title'))
+        artist = _musicbrainz_artist(raw)
+        date = _text(raw.get('date'))[:4]
+        country = _text(raw.get('country'))
+        extra = f"score {_text(raw.get('score') or raw.get('_local_score'))}".strip()
+    elif source == 'Deezer':
+        title = _text(raw.get('title'))
+        artist_obj = raw.get('artist') if isinstance(raw.get('artist'), dict) else {}
+        artist = _text(artist_obj.get('name'))
+        date = _text(raw.get('release_date'))[:4]
+        country = ''
+        extra = f"Deezer ID {_text(raw.get('id'))}".strip()
+    elif source == 'iTunes':
+        title = _text(raw.get('collectionName'))
+        artist = _text(raw.get('artistName'))
+        date = _text(raw.get('releaseDate'))[:4]
+        country = _text(raw.get('country'))
+        extra = f"iTunes ID {_text(raw.get('collectionId'))}".strip()
+    else:
+        title = _text(raw.get('title'))
+        artist = title.split(' - ', 1)[0] if ' - ' in title else ''
+        date = _text(raw.get('year'))
+        country = _text(raw.get('country'))
+        extra = ', '.join(_text(fmt) for fmt in (raw.get('format') or []) if _text(fmt))
+    return [source, title, artist, date, country, extra]
+
+
+def _provider_for_release_source(source: str):
+    source = _text(source)
+    if source == 'MusicBrainz':
+        return MusicBrainzProvider()
+    if source == 'Deezer':
+        return DeezerProvider()
+    if source == 'iTunes':
+        return ITunesProvider()
+    if source == 'Discogs':
+        return DiscogsProvider()
+    raise ValueError(f'Unsupported release source: {source}')
 
 
 def _image_pixmap(source: Any) -> Optional[QPixmap]:
@@ -453,6 +513,104 @@ class SearchWorker(QThread):
                 'stopped': self.stop_event.is_set(),
                 'status_counts': status_counts,
             })
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ReleaseSearchWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, artist: str, album: str, year: str, settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.artist = _text(artist)
+        self.album = _text(album)
+        self.year = _text(year)
+        self.settings = dict(settings or {})
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def run(self) -> None:
+        try:
+            out: List[Dict[str, Any]] = []
+            if self.settings.get('musicbrainz_enabled', True) and not self.stop_event.is_set():
+                provider = MusicBrainzProvider()
+                for rel in provider.search_releases(self.artist, self.album, year=self.year, limit=20, stop_event=self.stop_event):
+                    out.append({'source': 'MusicBrainz', 'raw': rel})
+            if self.settings.get('deezer_enabled', True) and not self.stop_event.is_set():
+                provider = DeezerProvider()
+                for res in provider.search_albums(self.artist, self.album, year=self.year, limit=20, stop_event=self.stop_event):
+                    out.append({'source': 'Deezer', 'raw': res})
+            if self.settings.get('itunes_enabled', True) and not self.stop_event.is_set():
+                provider = ITunesProvider()
+                for res in provider.search_albums(self.artist, self.album, year=self.year, limit=20, stop_event=self.stop_event):
+                    out.append({'source': 'iTunes', 'raw': res})
+            if self.settings.get('discogs_enabled', True) and not self.stop_event.is_set():
+                provider = DiscogsProvider()
+                if getattr(provider, 'token', ''):
+                    for res in provider.search(self.artist, self.album, year=self.year, limit=20):
+                        out.append({'source': 'Discogs', 'raw': res})
+            self.completed.emit({'items': out, 'stopped': self.stop_event.is_set()})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class ReleaseImportWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        album: Dict[str, Any],
+        item: Dict[str, Any],
+        artist: str,
+        album_title: str,
+        settings: Dict[str, Any],
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.album = dict(album or {})
+        self.item = dict(item or {})
+        self.artist = _text(artist)
+        self.album_title = _text(album_title)
+        self.settings = dict(settings or {})
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def run(self) -> None:
+        try:
+            album_key = _text(self.album.get('album_key'))
+            album_path = _text(self.album.get('album_path'))
+            if not album_key:
+                raise ValueError('The selected album has no saved queue key.')
+            provider = _provider_for_release_source(_text(self.item.get('source')))
+            cands = provider.get_candidates_from_release(
+                self.artist or _text(self.album.get('artist')),
+                self.album_title or _text(self.album.get('album')),
+                album_key,
+                self.item.get('raw') if isinstance(self.item.get('raw'), dict) else {},
+                max_candidates=8,
+                stop_event=self.stop_event,
+            )
+            added = 0
+            for cand in cands:
+                cand = dict(cand or {})
+                cand.update({'album_folder': album_path})
+                cand['candidate_id'] = db.add_candidate(album_key, cand)
+                added += 1
+            if added:
+                db.set_album_status(album_key, 'candidate_found')
+                db.update_album_notes(album_key, {
+                    'state_evaluation': {
+                        'status': 'candidate_found',
+                        'reason': f'{added} selected-release artwork option(s) imported',
+                    }
+                })
+            self.completed.emit({'album_key': album_key, 'added': added})
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -1350,6 +1508,221 @@ class ProblemFilesDialog(QDialog):
         layout.addWidget(buttons)
 
 
+class ReleasePickerDialog(QDialog):
+    release_imported = Signal(object)
+
+    def __init__(self, album: Dict[str, Any], settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.album = dict(album or {})
+        self.settings = dict(settings or {})
+        self.results: List[Dict[str, Any]] = []
+        self.search_worker: Optional[ReleaseSearchWorker] = None
+        self.import_worker: Optional[ReleaseImportWorker] = None
+
+        self.setWindowTitle('Choose Release')
+        self.resize(860, 560)
+        self.setMinimumSize(680, 440)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title = QLabel('Choose Release')
+        title.setObjectName('sectionTitle')
+        layout.addWidget(title)
+
+        hint = QLabel('Use this when automatic searching picked the wrong album artwork.')
+        hint.setObjectName('mutedLabel')
+        layout.addWidget(hint)
+
+        form_wrap = QFrame()
+        form_layout = QGridLayout(form_wrap)
+        form_layout.setContentsMargins(0, 0, 0, 0)
+        form_layout.setHorizontalSpacing(8)
+        form_layout.setVerticalSpacing(8)
+        self.artist_edit = QLineEdit(_text(self.album.get('search_artist') or self.album.get('artist')))
+        self.album_edit = QLineEdit(_text(self.album.get('search_album') or self.album.get('album')))
+        self.year_edit = QLineEdit(_text(self.album.get('year')))
+        self.year_edit.setMaximumWidth(90)
+        self.search_btn = QPushButton('Search Releases')
+        self.search_btn.setObjectName('primaryButton')
+        self.search_btn.clicked.connect(self.search_releases)
+        form_layout.addWidget(QLabel('Artist'), 0, 0)
+        form_layout.addWidget(self.artist_edit, 0, 1)
+        form_layout.addWidget(QLabel('Album'), 1, 0)
+        form_layout.addWidget(self.album_edit, 1, 1)
+        form_layout.addWidget(QLabel('Year'), 0, 2)
+        form_layout.addWidget(self.year_edit, 0, 3)
+        form_layout.addWidget(self.search_btn, 1, 2, 1, 2)
+        form_layout.setColumnStretch(1, 1)
+        layout.addWidget(form_wrap)
+
+        self.status_label = QLabel('Search for the exact album/release, then choose the one that matches your copy.')
+        self.status_label.setObjectName('mutedLabel')
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(['Source', 'Release / Album', 'Artist', 'Year', 'Country', 'Format / Score'])
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(31)
+        self.table.setTextElideMode(Qt.ElideRight)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(True)
+        widths = [96, 250, 170, 66, 78, 150]
+        for col, width in enumerate(widths):
+            header.setSectionResizeMode(col, QHeaderView.Interactive)
+            self.table.setColumnWidth(col, width)
+        self.table.itemSelectionChanged.connect(self._refresh_use_state)
+        self.table.doubleClicked.connect(lambda _idx=None: self.use_selected_release())
+        layout.addWidget(self.table, 1)
+
+        bottom = QHBoxLayout()
+        self.browser_btn = QPushButton('Open Search in Browser')
+        self.browser_btn.setObjectName('quietButton')
+        self.browser_btn.clicked.connect(self.open_browser_search)
+        bottom.addWidget(self.browser_btn)
+        bottom.addStretch(1)
+        self.use_btn = QPushButton('Use Selected Release')
+        self.use_btn.setObjectName('approveButton')
+        self.use_btn.setEnabled(False)
+        self.use_btn.clicked.connect(self.use_selected_release)
+        self.close_btn = QPushButton('Close')
+        self.close_btn.setObjectName('quietButton')
+        self.close_btn.clicked.connect(self.reject)
+        bottom.addWidget(self.use_btn)
+        bottom.addWidget(self.close_btn)
+        layout.addLayout(bottom)
+
+        QTimer.singleShot(150, self.search_releases)
+
+    def _busy(self) -> bool:
+        return any([
+            self.search_worker is not None and self.search_worker.isRunning(),
+            self.import_worker is not None and self.import_worker.isRunning(),
+        ])
+
+    def _set_busy(self, busy: bool, text: str = '') -> None:
+        self.search_btn.setEnabled(not busy)
+        self.browser_btn.setEnabled(not busy)
+        self.use_btn.setEnabled(False if busy else self.table.currentRow() >= 0)
+        self.close_btn.setEnabled(not busy)
+        if text:
+            self.status_label.setText(text)
+
+    def search_releases(self) -> None:
+        if self._busy():
+            return
+        artist = self.artist_edit.text().strip()
+        album = self.album_edit.text().strip()
+        year = self.year_edit.text().strip()
+        if not artist and not album:
+            self.status_label.setText('Enter an artist or album name first.')
+            return
+        self.results = []
+        self.table.setRowCount(0)
+        self._set_busy(True, 'Searching MusicBrainz, Deezer, iTunes, and Discogs releases...')
+        worker = ReleaseSearchWorker(artist, album, year, self.settings, self)
+        worker.completed.connect(self._release_search_completed)
+        worker.failed.connect(self._release_search_failed)
+        worker.finished.connect(lambda w=worker: self._release_search_finished(w))
+        self.search_worker = worker
+        worker.start()
+
+    def _release_search_completed(self, payload: object) -> None:
+        payload = dict(payload or {})
+        self.results = [dict(item or {}) for item in (payload.get('items') or [])]
+        self.table.setRowCount(len(self.results))
+        for row, item in enumerate(self.results):
+            for col, value in enumerate(_release_row_values(item)):
+                self.table.setItem(row, col, QTableWidgetItem(value))
+        if self.results:
+            self.table.selectRow(0)
+        stopped = ' Search stopped.' if payload.get('stopped') else ''
+        self.status_label.setText(f'Found {len(self.results)} release match(es).{stopped}')
+        self._set_busy(False)
+        self._refresh_use_state()
+
+    def _release_search_failed(self, message: str) -> None:
+        self.status_label.setText(f'Release search failed: {_text(message)}')
+        self._set_busy(False)
+        QMessageBox.warning(self, 'Release search failed', _text(message, 'Release search failed.'))
+
+    def _release_search_finished(self, worker: ReleaseSearchWorker) -> None:
+        if self.search_worker is worker:
+            self.search_worker = None
+        self._set_busy(False)
+
+    def _refresh_use_state(self) -> None:
+        self.use_btn.setEnabled(bool(not self._busy() and 0 <= self.table.currentRow() < len(self.results)))
+
+    def _selected_release_item(self) -> Optional[Dict[str, Any]]:
+        row = self.table.currentRow()
+        if 0 <= row < len(self.results):
+            return self.results[row]
+        return None
+
+    def use_selected_release(self) -> None:
+        item = self._selected_release_item()
+        if not item or self._busy():
+            return
+        self._set_busy(True, 'Downloading artwork from the selected release...')
+        worker = ReleaseImportWorker(
+            self.album,
+            item,
+            self.artist_edit.text().strip(),
+            self.album_edit.text().strip(),
+            self.settings,
+            self,
+        )
+        worker.completed.connect(self._release_import_completed)
+        worker.failed.connect(self._release_import_failed)
+        worker.finished.connect(lambda w=worker: self._release_import_finished(w))
+        self.import_worker = worker
+        worker.start()
+
+    def _release_import_completed(self, payload: object) -> None:
+        payload = dict(payload or {})
+        added = int(payload.get('added') or 0)
+        if added:
+            self.status_label.setText(f'Added {added} artwork option(s) from the selected release.')
+            self.release_imported.emit(payload)
+            self.accept()
+        else:
+            self.status_label.setText('Selected release had no artwork at or above the fetch minimum. Try another release or use Google/import.')
+            self._set_busy(False)
+
+    def _release_import_failed(self, message: str) -> None:
+        self.status_label.setText(f'Artwork download failed: {_text(message)}')
+        self._set_busy(False)
+        QMessageBox.warning(self, 'Selected release failed', _text(message, 'Artwork download failed.'))
+
+    def _release_import_finished(self, worker: ReleaseImportWorker) -> None:
+        if self.import_worker is worker:
+            self.import_worker = None
+        self._set_busy(False)
+
+    def open_browser_search(self) -> None:
+        artist = self.artist_edit.text().strip()
+        album = self.album_edit.text().strip()
+        query = quote(f'{artist} {album} deezer itunes apple discogs musicbrainz release'.strip())
+        if query:
+            webbrowser.open(f'https://www.google.com/search?q={query}')
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if self._busy():
+            QMessageBox.information(self, 'Release search running', 'Wait for the release search/download to finish before closing this window.')
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 class QtArtworkWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1613,6 +1986,8 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu = QMenu(self)
         self.google_action = QAction(_line_icon('search'), 'Open Google Images', self)
         self.google_action.triggered.connect(self.open_google_images_for_current_album)
+        self.choose_release_action = QAction(_line_icon('search'), 'Choose Release', self)
+        self.choose_release_action.triggered.connect(self.choose_release_for_current_album)
         self.refresh_album_action = QAction(_line_icon('refresh'), 'Refresh From Disk', self)
         self.refresh_album_action.triggered.connect(self.refresh_current_album_from_disk)
         self.problem_files_action = QAction(_line_icon('scan'), 'Show Problem Files', self)
@@ -1624,6 +1999,7 @@ class QtArtworkWindow(QMainWindow):
         self.rework_action = QAction(_line_icon('refresh'), 'Rework Album', self)
         self.rework_action.triggered.connect(self.rework_current_album)
         self.more_menu.addAction(self.google_action)
+        self.more_menu.addAction(self.choose_release_action)
         self.more_menu.addAction(self.refresh_album_action)
         self.more_menu.addAction(self.problem_files_action)
         self.more_menu.addSeparator()
@@ -2322,6 +2698,7 @@ class QtArtworkWindow(QMainWindow):
         self.import_btn.setEnabled(can_use_active_album)
         self.more_btn.setEnabled(bool(has_album_key and not busy))
         self.google_action.setEnabled(bool(has_album_key and not busy))
+        self.choose_release_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'} and not busy))
         self.refresh_album_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.mark_good_action.setEnabled(can_use_active_album)
@@ -2929,6 +3306,33 @@ class QtArtworkWindow(QMainWindow):
     def _deep_check_worker_finished(self, worker: AlbumDeepCheckWorker) -> None:
         if self.deep_check_worker is worker:
             self.deep_check_worker = None
+        self._refresh_action_states()
+
+    def choose_release_for_current_album(self) -> None:
+        album = self.current_album or {}
+        album_key = _text(album.get('album_key'))
+        if not album_key:
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        dialog = ReleasePickerDialog(album, self.settings, self)
+        dialog.release_imported.connect(self._release_picker_imported)
+        dialog.exec()
+
+    def _release_picker_imported(self, payload: object) -> None:
+        payload = dict(payload or {})
+        album_key = _text(payload.get('album_key'))
+        added = int(payload.get('added') or 0)
+        self.queue_filter = 'Review'
+        self.reload_queue(select_first=False)
+        self._set_queue_filter('Review')
+        if album_key:
+            self._select_album_key(album_key, fallback_first=True)
+        message = f'Added {added} artwork option(s) from the selected release.'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
         self._refresh_action_states()
 
     def open_google_images_for_current_album(self) -> None:
