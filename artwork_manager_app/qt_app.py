@@ -359,6 +359,7 @@ class SearchWorker(QThread):
                 status_counts[status] = status_counts.get(status, 0) + 1
             self.completed.emit({
                 'album_key': self.infos[0].get('album_key') if self.infos else '',
+                'album_keys': [info.get('album_key') for info in self.infos if info.get('album_key')],
                 'album_count': len(self.infos),
                 'saved': saved,
                 'stopped': self.stop_event.is_set(),
@@ -1142,6 +1143,13 @@ class QtArtworkWindow(QMainWindow):
         self.find_btn.clicked.connect(self.find_artwork_for_selected_album)
         actions.addWidget(self.find_btn)
 
+        self.search_next_btn = QPushButton('Search Next')
+        self.search_next_btn.setObjectName('quietButton')
+        self.search_next_btn.setIcon(_line_icon('search'))
+        self.search_next_btn.setIconSize(QSize(16, 16))
+        self.search_next_btn.clicked.connect(self.search_next_batch)
+        actions.addWidget(self.search_next_btn)
+
         self.stop_search_btn = QPushButton('Stop')
         self.stop_search_btn.setObjectName('dangerButton')
         self.stop_search_btn.setIcon(_line_icon('stop', '#ffffff'))
@@ -1395,6 +1403,38 @@ class QtArtworkWindow(QMainWindow):
                 return 'Done'
             return 'All'
         return ''
+
+    def _first_album_key_in_buckets(self, album_keys: List[Any], buckets: set[str]) -> str:
+        wanted = {_text(key) for key in album_keys if _text(key)}
+        if not wanted:
+            return ''
+        by_key = {_text(album.get('album_key')): album for album in self.albums}
+        for key in album_keys:
+            key = _text(key)
+            album = by_key.get(key)
+            if album and self._album_bucket(album) in buckets:
+                return key
+        return ''
+
+    def _searchable_batch_albums(self) -> List[Dict[str, Any]]:
+        if not self.visible_albums:
+            return []
+        current_row = self.table.currentRow()
+        if current_row < 0 or current_row >= len(self.visible_albums):
+            current_row = 0
+        ordered = self.visible_albums[current_row:] + self.visible_albums[:current_row]
+        out: List[Dict[str, Any]] = []
+        seen = set()
+        for album in ordered:
+            key = _text(album.get('album_key'))
+            if not key or key in seen or not _text(album.get('album_path')):
+                continue
+            bucket = self._album_bucket(album)
+            if bucket not in {'Missing', 'Needs Search', 'Not Square'}:
+                continue
+            out.append(album)
+            seen.add(key)
+        return out
 
     def _queue_column_widths_from_settings(self) -> Dict[str, int]:
         layout = self.settings.get('layout') if isinstance(self.settings.get('layout'), dict) else {}
@@ -1725,7 +1765,12 @@ class QtArtworkWindow(QMainWindow):
         album = self.current_album or {}
         bucket = self._album_bucket(album) if album else ''
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
+        batch_count = get_batch_search_count(self.settings)
+        self.search_next_btn.setText(f'Search Next {batch_count}')
+        self.search_next_btn.setToolTip(f'Search the next {batch_count} missing, needs-search, or not-square albums in the visible queue')
+        can_search_next = bool(self._searchable_batch_albums())
         self.find_btn.setEnabled(can_search and not busy)
+        self.search_next_btn.setEnabled(can_search_next and not busy)
         self.stop_search_btn.setVisible(search_busy)
         self.stop_search_btn.setEnabled(search_busy)
         self.approve_btn.setEnabled(has_candidate and not busy)
@@ -1807,6 +1852,43 @@ class QtArtworkWindow(QMainWindow):
         self._refresh_action_states()
         worker.start()
 
+    def search_next_batch(self) -> None:
+        if self.search_worker is not None and self.search_worker.isRunning():
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        batch_count = get_batch_search_count(self.settings)
+        albums = self._searchable_batch_albums()[:batch_count]
+        infos = [self._album_to_search_info(album) for album in albums]
+        infos = [info for info in infos if info and info.get('album_key') and info.get('album_path')]
+        if not infos:
+            self.approval_status.setText('No visible albums need batch search.')
+            self.statusBar().showMessage('No visible albums need batch search.')
+            self._refresh_action_states()
+            return
+        max_per_album = get_max_candidates_per_album(self.settings)
+        first = infos[0]
+        first_label = f"{_text(first.get('artist'), 'Unknown Artist')} - {_text(first.get('album'), 'Unknown Album')}"
+        self.last_search_album_key = _text(first.get('album_key'))
+        self.last_search_log = [f'Search Next: {len(infos)} album(s)', f'First: {first_label}']
+        self.approval_status.setText(f'Searching next {len(infos)} album(s)...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage(f'Searching next {len(infos)} album(s)...')
+
+        worker = SearchWorker(infos, max_per_album, self)
+        worker.status_update.connect(self._search_status)
+        worker.log_line.connect(self._search_log)
+        worker.candidate_found.connect(self._search_candidate_found)
+        worker.completed.connect(self._search_completed)
+        worker.failed.connect(self._search_failed)
+        worker.finished.connect(lambda w=worker: self._search_worker_finished(w))
+        self.search_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
     def stop_search(self) -> None:
         if self.search_worker is not None and self.search_worker.isRunning():
             self.search_worker.stop()
@@ -1843,7 +1925,16 @@ class QtArtworkWindow(QMainWindow):
         self.approval_progress.setVisible(False)
         saved = int(result.get('saved') or 0)
         stopped = bool(result.get('stopped'))
-        if stopped:
+        album_count = int(result.get('album_count') or 1)
+        album_keys = [_text(key) for key in (result.get('album_keys') or []) if _text(key)]
+        if album_count > 1:
+            if stopped:
+                message = f'Search Next stopped after saving {saved} option(s).'
+            elif saved:
+                message = f'Search Next found {saved} new option(s) across {album_count} album(s).'
+            else:
+                message = 'Search Next finished. No new artwork options found.'
+        elif stopped:
             message = f'Search stopped after saving {saved} option(s).'
         elif saved:
             message = f'Found {saved} new artwork option(s).'
@@ -1853,6 +1944,8 @@ class QtArtworkWindow(QMainWindow):
         self.statusBar().showMessage(message)
         target_key = _text(result.get('album_key'))
         self.reload_queue(select_first=False)
+        if album_count > 1:
+            target_key = self._first_album_key_in_buckets(album_keys, {'Review'}) or target_key
         if target_key and not self._select_album_key(target_key, fallback_first=False):
             target_filter = self._queue_filter_for_album_key(target_key)
             if target_filter:
@@ -1862,7 +1955,9 @@ class QtArtworkWindow(QMainWindow):
                 self._select_album_key(target_key, fallback_first=True)
             else:
                 self._select_album_key(target_key, fallback_first=True)
-        if not saved and not stopped:
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        if album_count <= 1 and not saved and not stopped:
             QMessageBox.information(self, 'Artwork search', message)
 
     def _search_failed(self, message: str) -> None:

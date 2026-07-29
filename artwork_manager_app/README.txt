@@ -1,4 +1,4 @@
-Build 4.68 — Qt scan and settings migration
+Build 4.69 — Qt batch search migration
 
 - Scan / Resume checks multiple album folders in parallel, which should be much faster on NAS/SMB libraries.
 - Added a Settings control for how many album folders can be checked at once; the default is 8.
@@ -25,6 +25,7 @@ Build 4.68 — Qt scan and settings migration
 - Added native Qt Scan Library, using the same threaded scanner and incremental NAS-friendly resume logic as the existing app.
 - Added a native Qt Settings dialog for artwork rules, provider switches, approval defaults, scan concurrency, and NAS worker mapping.
 - The Qt toolbar now uses direct Refresh, Scan Library, and Settings actions instead of handing routine work to the old window.
+- Added Qt Search Next, which batch-searches the next visible albums that need artwork and follows the first album that becomes ready for review.
 
 Qt review branch
 
