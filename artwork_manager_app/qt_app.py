@@ -883,6 +883,54 @@ class RestoreBackupWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class RepairStaleCandidatesWorker(QThread):
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, settings: Dict[str, Any], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.settings = dict(settings or {})
+
+    def run(self) -> None:
+        try:
+            rows = db.all_candidate_file_rows(include_rejected=True)
+            stale_ids = []
+            affected = set()
+            for row in rows:
+                path = _text(row.get('image_path'))
+                if path and not os.path.exists(path):
+                    candidate_id = row.get('id')
+                    if candidate_id is None:
+                        continue
+                    stale_ids.append(candidate_id)
+                    key = _text(row.get('album_key'))
+                    if key:
+                        affected.add(key)
+            removed = db.delete_candidate_ids(stale_ids)
+            reclassified = 0
+            warnings = []
+            for key in sorted(affected):
+                try:
+                    db.evaluate_and_set_album_state(
+                        key,
+                        preserve_user_terminal=False,
+                        settings=self.settings,
+                    )
+                    reclassified += 1
+                except Exception as exc:
+                    warnings.append({'album_key': key, 'error': str(exc)})
+            self.completed.emit({
+                'checked': len(rows),
+                'stale': len(stale_ids),
+                'removed': removed,
+                'affected': len(affected),
+                'reclassified': reclassified,
+                'warnings': warnings,
+            })
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class LibraryScanWorker(QThread):
     progress = Signal(int, int, str)
     album_queued = Signal(object)
@@ -2095,6 +2143,7 @@ class QtArtworkWindow(QMainWindow):
         self.search_worker: Optional[SearchWorker] = None
         self.album_rescan_worker: Optional[AlbumRescanWorker] = None
         self.deep_check_worker: Optional[AlbumDeepCheckWorker] = None
+        self.repair_worker: Optional[RepairStaleCandidatesWorker] = None
         self.scan_dialog: Optional[ScanDialog] = None
         self.last_approval_result: Optional[Dict[str, Any]] = None
         self.last_convert_result: Optional[Dict[str, Any]] = None
@@ -2355,6 +2404,8 @@ class QtArtworkWindow(QMainWindow):
         self.problem_files_action.triggered.connect(self.show_problem_files_for_current_album)
         self.backup_restore_action = QAction(_line_icon('folder'), 'Backup / Restore', self)
         self.backup_restore_action.triggered.connect(self.open_backup_restore_browser)
+        self.repair_stale_action = QAction(_line_icon('scan'), 'Repair Missing Option Rows', self)
+        self.repair_stale_action.triggered.connect(self.repair_stale_candidate_rows)
         self.convert_save_action = QAction(_line_icon('refresh'), 'Convert/Save Current Artwork', self)
         self.convert_save_action.triggered.connect(self.convert_save_current_artwork)
         self.convert_save_next_action = QAction(_line_icon('refresh'), 'Convert/Save Next', self)
@@ -2373,6 +2424,7 @@ class QtArtworkWindow(QMainWindow):
         self.more_menu.addAction(self.refresh_album_action)
         self.more_menu.addAction(self.problem_files_action)
         self.more_menu.addAction(self.backup_restore_action)
+        self.more_menu.addAction(self.repair_stale_action)
         self.more_menu.addAction(self.convert_save_action)
         self.more_menu.addAction(self.convert_save_next_action)
         self.more_menu.addAction(self.reject_all_action)
@@ -3113,7 +3165,8 @@ class QtArtworkWindow(QMainWindow):
         search_busy = self.search_worker is not None and self.search_worker.isRunning()
         rescan_busy = self.album_rescan_worker is not None and self.album_rescan_worker.isRunning()
         deep_check_busy = self.deep_check_worker is not None and self.deep_check_worker.isRunning()
-        busy = approval_busy or convert_busy or search_busy or rescan_busy or deep_check_busy
+        repair_busy = self.repair_worker is not None and self.repair_worker.isRunning()
+        busy = approval_busy or convert_busy or search_busy or rescan_busy or deep_check_busy or repair_busy
         album = self.current_album or {}
         bucket = self._album_bucket(album) if album else ''
         can_search = bool(album and _text(album.get('album_key')) and _text(album.get('album_path')) and bucket not in {'Good', 'Handled'})
@@ -3144,6 +3197,7 @@ class QtArtworkWindow(QMainWindow):
         self.refresh_album_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.problem_files_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and not busy))
         self.backup_restore_action.setEnabled(not busy)
+        self.repair_stale_action.setEnabled(not busy)
         self.convert_save_action.setEnabled(bool(has_album_key and _text(album.get('album_path')) and bucket in {'Not Square', 'Convert'} and not busy))
         self.convert_save_next_action.setEnabled(bool(can_convert_next and not busy))
         self.reject_all_action.setEnabled(bool(has_album_key and self.current_candidates and not busy))
@@ -3986,6 +4040,68 @@ class QtArtworkWindow(QMainWindow):
         self.approval_status.setText(message)
         self.statusBar().showMessage(message)
 
+    def repair_stale_candidate_rows(self) -> None:
+        if self.repair_worker is not None and self.repair_worker.isRunning():
+            return
+        answer = QMessageBox.question(
+            self,
+            'Repair missing option rows?',
+            'Remove saved artwork option records whose image files are missing?\n\nThis does not touch music files or artwork files.',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            self.settings = load_settings()
+        except Exception:
+            pass
+        self.approval_status.setText('Checking saved artwork option rows...')
+        self.approval_progress.setVisible(True)
+        self.approval_progress.setRange(0, 0)
+        self.statusBar().showMessage('Repairing missing option rows...')
+        worker = RepairStaleCandidatesWorker(self.settings, self)
+        worker.completed.connect(self._repair_stale_completed)
+        worker.failed.connect(self._repair_stale_failed)
+        worker.finished.connect(lambda w=worker: self._repair_worker_finished(w))
+        self.repair_worker = worker
+        self._refresh_action_states()
+        worker.start()
+
+    def _repair_stale_completed(self, result: object) -> None:
+        result = dict(result or {})
+        self.approval_progress.setVisible(False)
+        current_key = _text((self.current_album or {}).get('album_key'))
+        removed = int(result.get('removed') or 0)
+        affected = int(result.get('affected') or 0)
+        reclassified = int(result.get('reclassified') or 0)
+        warnings = list(result.get('warnings') or [])
+        self.reload_queue(select_first=False)
+        if current_key:
+            self._select_album_key(current_key, fallback_first=True)
+        message = f'Repair complete: removed {removed} stale option row(s).'
+        if affected:
+            message += f' Reclassified {reclassified}/{affected} affected album(s).'
+        if warnings:
+            message += f' {len(warnings)} warning(s).'
+        self.approval_status.setText(message)
+        self.statusBar().showMessage(message)
+        if warnings:
+            QMessageBox.warning(self, 'Repair finished with warnings', message)
+
+    def _repair_stale_failed(self, message: str) -> None:
+        self.approval_progress.setVisible(False)
+        message = _text(message, 'Repair failed.')
+        self.approval_status.setText(message)
+        self.statusBar().showMessage('Repair failed')
+        QMessageBox.warning(self, 'Repair failed', message)
+        self._refresh_action_states()
+
+    def _repair_worker_finished(self, worker: RepairStaleCandidatesWorker) -> None:
+        if self.repair_worker is worker:
+            self.repair_worker = None
+        self._refresh_action_states()
+
     def convert_save_current_artwork(self) -> None:
         album = self.current_album or {}
         album_key = _text(album.get('album_key'))
@@ -4325,6 +4441,10 @@ class QtArtworkWindow(QMainWindow):
             QMessageBox.information(self, 'Problem file check still running', 'Wait for the selected album check to finish before closing Artwork Manager.')
             event.ignore()
             return
+        if self.repair_worker is not None and self.repair_worker.isRunning():
+            QMessageBox.information(self, 'Repair still running', 'Wait for missing-option repair to finish before closing Artwork Manager.')
+            event.ignore()
+            return
         if self.convert_worker is not None and self.convert_worker.isRunning():
             QMessageBox.information(self, 'Convert/Save still running', 'Wait for the selected album Convert/Save to finish before closing Artwork Manager.')
             event.ignore()
@@ -4356,6 +4476,11 @@ class QtArtworkWindow(QMainWindow):
         if self.convert_worker is not None:
             try:
                 self.convert_worker.wait(500)
+            except Exception:
+                pass
+        if self.repair_worker is not None:
+            try:
+                self.repair_worker.wait(500)
             except Exception:
                 pass
         for worker in list(self.current_art_workers):
