@@ -1,5 +1,6 @@
-Build 4.94 — Qt selection batches
+Build 4.95 — Qt fixed review widths
 
+- Fixed long album/file-path text in the right-hand artwork panels so it truncates instead of squeezing the queue panel.
 - Added multi-select to the Qt queue, with Album Tools > Selection actions for Search Selected, Convert/Save Selected, Mark Selected Good, and Ignore Selected.
 - The queue count now quietly shows how many albums are selected when using batch actions.
 - Added Qt Import From URL for Deezer, Apple/iTunes, MusicBrainz, Discogs release links, Google redirect links, and direct image URLs.

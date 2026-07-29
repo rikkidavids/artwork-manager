@@ -2280,7 +2280,7 @@ class ImagePanel(QFrame):
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setObjectName('artworkPreview')
         self.image_label.setProperty('empty', True)
-        self.meta_label = QLabel('')
+        self.meta_label = ElidedLabel('')
         self.meta_label.setObjectName('mutedLabel')
         self.meta_label.setAlignment(Qt.AlignCenter)
 
