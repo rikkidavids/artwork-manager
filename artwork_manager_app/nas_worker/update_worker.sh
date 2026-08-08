@@ -16,6 +16,18 @@ echo "Artwork Manager NAS Worker 5.04 rebuild/update"
 echo "Project folder: $(pwd)"
 echo "This rebuilds the image and recreates the container. A plain restart is not enough after code changes."
 
+if [ ! -f .env ] && [ -f .env.example ]; then
+  cp .env.example .env
+  echo
+  echo "Created local .env from .env.example."
+  echo "Edit .env to set AMW_TOKEN and AMW_MUSIC_PATH before using the worker for real."
+fi
+
+if [ -f .env ] && grep -q '^AMW_TOKEN=change-me$' .env; then
+  echo
+  echo "WARNING: .env still uses AMW_TOKEN=change-me. Use a private token and paste the same value into the Mac app Settings."
+fi
+
 mkdir -p backups
 
 $COMPOSE down --remove-orphans || true

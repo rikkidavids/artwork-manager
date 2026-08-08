@@ -22,22 +22,52 @@ New in 5.04:
 - Existing embed, convert/save, baseline JPEG, square-padding, deep-check, timing, and busy-guard logic is preserved.
 
 Files:
+- .env.example
 - server.py
 - requirements.txt
 - Dockerfile
 - docker-compose.yml
 - update_worker.sh
+- update_from_github.sh
 - verify_worker.py
+
+Easiest GitHub-linked Synology setup:
+This keeps a Git checkout on the NAS, limited to the nas_worker folder, then rebuilds the local Docker project from that checkout.
+
+First-time setup from an SSH/Terminal session on the NAS:
+   cd /volume1/docker
+   git clone --filter=blob:none --sparse --branch main https://github.com/rikkidavids/artwork-manager.git artwork-manager
+   cd artwork-manager
+   git sparse-checkout set artwork_manager_app/nas_worker
+   cd artwork_manager_app/nas_worker
+   chmod +x update_worker.sh update_from_github.sh
+   cp .env.example .env
+
+Then edit .env once:
+   - Set AMW_TOKEN to a private token.
+   - Confirm AMW_MUSIC_PATH. For Rikki's setup it is:
+     AMW_MUSIC_PATH=/volume2/data/media/music
+   - If your music is elsewhere, change that value only.
+
+Initial build:
+   ./update_worker.sh
+
+Future updates:
+   cd /volume1/docker/artwork-manager/artwork_manager_app/nas_worker
+   ./update_from_github.sh
+
+If you want to track a different branch:
+   AMW_GIT_BRANCH=qt-prototype ./update_from_github.sh
 
 Recommended Synology update steps:
 1. Stop the old artwork-manager-worker project/container in Synology Container Manager.
 2. Copy this nas_worker folder to your NAS project folder, for example:
    /volume1/docker/artwork-manager-worker
-3. Edit docker-compose.yml:
+3. Copy .env.example to .env, then edit .env:
    - Set AMW_TOKEN to a private token.
-   - Confirm the music mapping. For Rikki's setup it is:
-     /volume2/data/media/music:/music:rw
-   - If your music is elsewhere, change only the left side of that mapping.
+   - Confirm AMW_MUSIC_PATH. For Rikki's setup it is:
+     AMW_MUSIC_PATH=/volume2/data/media/music
+   - If your music is elsewhere, change that value only.
 4. Rebuild/recreate the project. Do not only restart it.
 
 Terminal method from the NAS project folder:
