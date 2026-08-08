@@ -77,8 +77,8 @@ def worker_compatibility(info: Dict[str, Any]) -> Dict[str, Any]:
 
 def worker_update_hint() -> str:
     return (
-        'Update the Synology worker by copying the bundled nas_worker folder to the NAS, then rebuild/recreate '
-        'the Docker/Container Manager project. Restarting the existing project can keep using the old cached image. '
+        'Update the Synology worker from https://github.com/rikkidavids/artwork-manager-nas-worker. '
+        'The Synology project should pull ghcr.io/rikkidavids/artwork-manager-nas-worker:latest, then recreate the container. '
         'Open the worker URL in a browser afterwards; it should show '
         f'worker_build {EXPECTED_NAS_WORKER_BUILD} and api {MIN_NAS_WORKER_API}.'
     )
@@ -197,7 +197,7 @@ def _http_error_message(endpoint: str, exc: HTTPError, body: str = '') -> str:
         parsed = {}
     msg = str(parsed.get('message') or parsed.get('error') or body or exc)
     if exc.code == 401:
-        return 'NAS worker rejected the request. Check that the API token in the Mac app matches AMW_TOKEN in docker-compose.yml.'
+        return 'NAS worker rejected the request. Check that the API token in the Mac app matches AMW_TOKEN in the Synology worker settings.'
     if exc.code == 404 and endpoint in ('/health', '/status', '/version', '/'):
         return (
             f'NAS worker responded, but {endpoint} is missing or returned 404. '

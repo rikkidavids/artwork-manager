@@ -4,7 +4,7 @@ import os
 import shutil
 
 APP_NAME = 'Artwork Review Manager'
-BUILD_VERSION = 'Build 5.04 — NAS worker library scan'
+BUILD_VERSION = 'Build 5.05 — standalone NAS worker'
 MIN_ARTWORK_SIZE = 1000
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')

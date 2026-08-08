@@ -7,4 +7,3 @@ __pycache__/
 
 .local_app_data/
 .DS_Store
-artwork_manager_app/nas_worker/.env

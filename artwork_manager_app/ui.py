@@ -373,14 +373,14 @@ class SettingsWindow(tk.Toplevel):
         add_nas_row(4, 'Timeout seconds:', self.nas_worker_timeout)
         ttk.Label(
             body,
-            text='Example mapping: /Volumes/Music on the Mac → /music inside the container. After replacing worker files on Synology, rebuild/recreate the Docker project; do not only restart it. Worker files are included in app Resources/app/artwork_manager_app/nas_worker.',
+            text='Example mapping: /Volumes/Music on the Mac → /music inside the container. Install and update the worker from the separate artwork-manager-nas-worker GitHub/GHCR project.',
             foreground='gray', wraplength=560,
         ).pack(anchor='w', pady=(6, 0))
         nas_btns = ttk.Frame(body)
         nas_btns.pack(fill='x', pady=(8, 0))
         ttk.Button(nas_btns, text='Test NAS Worker', command=self.test_nas_worker).pack(side='left')
         ttk.Button(nas_btns, text='Worker Status', command=self.show_nas_worker_status).pack(side='left', padx=(8, 0))
-        ttk.Button(nas_btns, text='Open Worker Files', command=lambda: open_path(APP_DIR / 'nas_worker')).pack(side='left', padx=(8, 0))
+        ttk.Button(nas_btns, text='Open Worker Repo', command=lambda: webbrowser.open('https://github.com/rikkidavids/artwork-manager-nas-worker')).pack(side='left', padx=(8, 0))
 
         ttk.Separator(body).pack(fill='x', pady=(16, 12))
         ttk.Label(body, text='Storage / Cleanup', font=('TkDefaultFont', 15, 'bold')).pack(anchor='w')
