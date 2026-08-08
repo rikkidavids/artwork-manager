@@ -1,5 +1,6 @@
 Build 5.04 — NAS worker library scan
 
+- Preferred NAS worker updates now live in the separate repo: https://github.com/rikkidavids/artwork-manager-nas-worker
 - NAS worker now includes a GitHub update helper and local .env config so Synology can pull/rebuild without overwriting private settings.
 - Scan / Resume can now hand the folder walk and artwork checks to NAS Worker 5.04, avoiding thousands of SMB/VPN file checks from the Mac.
 - The NAS scan returns compact queue results and unchanged-folder fingerprints for the Mac app to store locally.

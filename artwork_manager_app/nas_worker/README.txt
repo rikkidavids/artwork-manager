@@ -1,5 +1,11 @@
 Artwork Manager NAS Worker — 5.04
 
+Preferred easy-update setup:
+Use the separate NAS worker repo here:
+   https://github.com/rikkidavids/artwork-manager-nas-worker
+
+That repo is set up for a normal Synology/GitHub Container Registry image workflow, so the NAS can pull a finished image instead of rebuilding from this bundled folder.
+
 This optional worker runs on a Synology NAS via Container Manager/Docker. The Mac app stays as the review UI, but scan / embed / convert / deep-check jobs can run on the NAS-local filesystem instead of touching every track over SMB/VPN.
 
 Why 5.04 exists:
