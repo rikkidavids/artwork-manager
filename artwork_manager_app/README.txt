@@ -1,8 +1,11 @@
-Build 5.05 — standalone NAS worker
+Build 5.06 — NAS scan progress
 
+- Scan Library now shows live NAS worker progress while remote scans are running.
+- The scan window now reports folders checked, covers needing work, unchanged folders skipped, and the latest album being checked.
+- Live scan progress requires NAS worker 5.05/API 4.
 - Removed bundled NAS worker Docker files from the Mac app repo now that the worker lives in its own GitHub/GHCR project.
 - NAS worker updates now live in the separate repo: https://github.com/rikkidavids/artwork-manager-nas-worker
-- Scan / Resume can now hand the folder walk and artwork checks to NAS Worker 5.04, avoiding thousands of SMB/VPN file checks from the Mac.
+- Scan / Resume can now hand the folder walk and artwork checks to NAS Worker 5.05, avoiding thousands of SMB/VPN file checks from the Mac.
 - The NAS scan returns compact queue results and unchanged-folder fingerprints for the Mac app to store locally.
 - The Qt review workflow now uses simpler cover-focused labels such as Find Cover, Use This Cover, Reject Cover, and Fix Current Cover.
 - The bottom action row now hides candidate-only and inactive actions until they are useful.

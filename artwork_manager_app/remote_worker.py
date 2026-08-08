@@ -26,8 +26,8 @@ from .config import (
     get_scan_worker_threads,
 )
 
-EXPECTED_NAS_WORKER_BUILD = '5.04'
-MIN_NAS_WORKER_API = 3
+EXPECTED_NAS_WORKER_BUILD = '5.05'
+MIN_NAS_WORKER_API = 4
 _COMPAT_CACHE_SECONDS = 300
 _COMPAT_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
 
@@ -294,9 +294,9 @@ def worker_version(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return info
 
 
-def worker_status(settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def worker_status(settings: Optional[Dict[str, Any]] = None, timeout: int = 8) -> Dict[str, Any]:
     settings = settings or load_settings()
-    info = _get('/status', settings=settings, timeout=8)
+    info = _get('/status', settings=settings, timeout=timeout)
     info['compatibility'] = worker_compatibility(info)
     return info
 

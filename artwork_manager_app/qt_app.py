@@ -1552,6 +1552,67 @@ class LibraryScanWorker(QThread):
     def stop(self) -> None:
         self.stop_event.set()
 
+    def _nas_scan_status_message(self, progress: Dict[str, Any]) -> tuple[int, str]:
+        def number(key: str) -> int:
+            try:
+                return int(progress.get(key) or 0)
+            except Exception:
+                return 0
+
+        checked = number('processed_albums')
+        queued = number('queued_albums')
+        skipped = number('skipped_unchanged')
+        backfilled = number('fingerprints_backfilled')
+        pending = number('pending_albums')
+        bits = [f'NAS worker checked {checked:,} folder(s)']
+        if queued:
+            bits.append(f'{queued:,} need work')
+        if skipped:
+            bits.append(f'{skipped:,} unchanged skipped')
+        if backfilled:
+            bits.append(f'{backfilled:,} fingerprinted')
+        if pending:
+            bits.append(f'{pending:,} checking now')
+        label = str(progress.get('last_action_label') or progress.get('current_album_path') or '').strip()
+        message = '; '.join(bits) + '.'
+        if label:
+            message += f' Latest: {_path_tail(label, parts=2)}'
+        return checked, message
+
+    def _start_nas_scan_status_poller(self, settings: Dict[str, Any]) -> tuple[threading.Event, threading.Thread]:
+        stop_polling = threading.Event()
+
+        def poll_status() -> None:
+            self.progress.emit(0, 0, 'STATUS:NAS worker is starting the library scan...')
+            while not stop_polling.wait(1.5):
+                try:
+                    status = worker_status(settings, timeout=3)
+                except Exception:
+                    continue
+                active_jobs = status.get('active_jobs') if isinstance(status.get('active_jobs'), list) else []
+                scan_job = None
+                for job in active_jobs:
+                    if isinstance(job, dict) and job.get('kind') == 'scan-library':
+                        scan_job = job
+                        break
+                if not scan_job:
+                    continue
+                progress = scan_job.get('scan_progress') if isinstance(scan_job.get('scan_progress'), dict) else {}
+                if not progress:
+                    try:
+                        duration = int(float(scan_job.get('duration_seconds') or 0))
+                    except Exception:
+                        duration = 0
+                    suffix = f' ({duration:,}s)' if duration else ''
+                    self.progress.emit(0, 0, f'STATUS:NAS worker is preparing the library scan{suffix}...')
+                    continue
+                checked, message = self._nas_scan_status_message(progress)
+                self.progress.emit(checked, 0, 'STATUS:' + message)
+
+        thread = threading.Thread(target=poll_status, name='ArtworkManagerNASScanStatus', daemon=True)
+        thread.start()
+        return stop_polling, thread
+
     def run(self) -> None:
         rows = []
         try:
@@ -1575,12 +1636,17 @@ class LibraryScanWorker(QThread):
             remote_result = {}
             if worker_enabled_for_path(self.library_root, settings):
                 self.progress.emit(0, 0, 'NAS worker scanning library locally...')
-                remote_result = scan_library_remote(
-                    self.library_root,
-                    include_missing=True,
-                    resume=True,
-                    settings=settings,
-                )
+                poll_stop, poll_thread = self._start_nas_scan_status_poller(settings)
+                try:
+                    remote_result = scan_library_remote(
+                        self.library_root,
+                        include_missing=True,
+                        resume=True,
+                        settings=settings,
+                    )
+                finally:
+                    poll_stop.set()
+                    poll_thread.join(timeout=1.0)
                 if self.stop_event.is_set():
                     db.finish_scan(stopped=True)
                     self.completed.emit({'stopped': True, 'queued': 0, 'csv': '', 'remote_worker': True})
@@ -2240,6 +2306,11 @@ class ScanDialog(QDialog):
             self.status_label.setText('Stopping after the current album finishes...')
 
     def _scan_progress(self, done: int, total: int, path: str) -> None:
+        status = str(path or '')
+        if status.startswith('STATUS:'):
+            self.progress.setRange(0, 0)
+            self.status_label.setText(status[7:].strip())
+            return
         if total > 0:
             self.progress.setRange(0, total)
             self.progress.setValue(max(0, min(done, total)))
