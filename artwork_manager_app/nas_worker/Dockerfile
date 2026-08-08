@@ -1,7 +1,7 @@
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="Artwork Manager NAS Worker" \
-      org.opencontainers.image.version="4.53" \
+      org.opencontainers.image.version="5.04" \
       org.opencontainers.image.description="NAS-local artwork embed, convert, and deep-check worker for Artwork Manager"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

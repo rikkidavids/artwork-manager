@@ -1,18 +1,21 @@
-Artwork Manager NAS Worker — 4.53
+Artwork Manager NAS Worker — 5.04
 
-This optional worker runs on a Synology NAS via Container Manager/Docker. The Mac app stays as the review UI, but embed / convert / deep-check jobs run on the NAS-local filesystem instead of rewriting every track over SMB/VPN.
+This optional worker runs on a Synology NAS via Container Manager/Docker. The Mac app stays as the review UI, but scan / embed / convert / deep-check jobs can run on the NAS-local filesystem instead of touching every track over SMB/VPN.
 
-Why 4.53 exists:
-- 4.48 already added worker API 2 and GET / status output.
-- If http://NAS-IP:8765/ still returns {"ok": false, "error": "not found"}, the NAS is still running an older cached worker container/image.
+Why 5.04 exists:
+- 4.53 added worker API 2, status output, path checking, and Unicode path fixes.
+- 5.04 adds worker API 3 and POST /scan-library so Scan / Resume can walk and inspect folders locally on the NAS.
+- If http://NAS-IP:8765/ still shows worker_build 4.53 or api 2, the NAS is still running an older cached worker container/image.
 - Restarting the container is not enough after replacing server.py. You must rebuild/recreate the Docker project/image.
 
-New in 4.53:
-- Fixes album paths with accented Unicode characters such as Zoë by resolving NFC/NFD-equivalent folder names inside the worker.
+New in 5.04:
+- POST /scan-library walks the mounted music root inside the worker, checks changed/new album folders on the NAS, and returns compact queue rows to the Mac app.
+- Resume scans can skip unchanged folders using scan fingerprints without the Mac doing thousands of SMB/VPN stat/tag reads.
+- Existing Unicode-normalized path handling is preserved for accented folder names such as Zoë.
 - GET / and GET /version are public LAN sanity checks and return worker_build, api, version, endpoints, uptime, and an update hint.
 - GET /status and GET /health still require the API token and include filesystem diagnostics for /music and /backups.
 - Every JSON response includes worker_build/api fields or headers where practical.
-- Docker Compose now has an explicit image tag, artwork-manager-worker:4.53, so the running version is easier to spot.
+- Docker Compose now has an explicit image tag, artwork-manager-worker:5.04, so the running version is easier to spot.
 - update_worker.sh force-rebuilds and recreates the container from the current files.
 - verify_worker.py checks the root/status endpoints and warns when Synology is still serving an old worker.
 - POST /path-check verifies the exact mapped album folder exists, is readable/writable, and counts supported music files.
@@ -62,9 +65,9 @@ Verification:
 1. From a browser on your Mac, open:
    http://YOUR-NAS-IP:8765/
 2. You should see:
-   worker_build: "4.53"
-   api: 2
-   endpoints containing GET /, GET /version, GET /status, POST /embed, POST /deep-check, POST /path-check
+   worker_build: "5.04"
+   api: 3
+   endpoints containing GET /, GET /version, GET /status, POST /scan-library, POST /embed, POST /deep-check, POST /path-check
 3. Optional terminal check from your Mac:
    python verify_worker.py http://YOUR-NAS-IP:8765 YOUR_TOKEN
 
@@ -81,4 +84,4 @@ Keep this worker on your LAN/VPN only. Do not expose port 8765 to the public int
 
 
 Unicode note:
-If the Mac app sends a folder name in decomposed Unicode but Synology stores it in composed Unicode, worker 4.53 resolves the on-disk folder component-by-component before embedding, deep-checking, or path-checking.
+If the Mac app sends a folder name in decomposed Unicode but Synology stores it in composed Unicode, worker 5.04 resolves the on-disk folder component-by-component before scanning, embedding, deep-checking, or path-checking.

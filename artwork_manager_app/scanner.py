@@ -943,6 +943,115 @@ def scan_library(library_root, include_missing=True, progress=None, stop_event=N
     return rows, {}
 
 
+def apply_remote_scan_results(items, *, min_artwork_size=None, on_album=None):
+    """Store compact album scan results returned by the NAS worker.
+
+    The NAS worker performs the slow filesystem/tag reads locally, but the Mac
+    app still owns SQLite and queue-state decisions. Keeping the final upsert
+    here means remote and local scans classify albums in the same way.
+    """
+    rows = []
+    seen_keys = set()
+    target_size = int(min_artwork_size or get_scan_min_artwork_size())
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get('fingerprint_update'):
+            key = item.get('album_key')
+            fingerprint = item.get('scan_fingerprint')
+            if key and fingerprint:
+                try:
+                    db.update_album_notes(key, {'scan_fingerprint': fingerprint})
+                except Exception:
+                    pass
+            continue
+        if item.get('skipped'):
+            continue
+
+        artist = str(item.get('artist') or '').strip()
+        album = str(item.get('album') or '').strip()
+        album_path = str(item.get('album_path') or '').strip()
+        if not artist and not album:
+            continue
+        if not album_path:
+            continue
+        key = album_key(artist, album, album_path)
+        identity = dict(item.get('identity') or {})
+        notes = dict(identity.get('notes') or {})
+        fingerprint = item.get('scan_fingerprint')
+        if fingerprint:
+            notes['scan_fingerprint'] = fingerprint
+        identity.update({
+            'artist': artist,
+            'album': album,
+            'search_artist': identity.get('search_artist') or item.get('search_artist') or artist,
+            'search_album': identity.get('search_album') or item.get('search_album') or album,
+            'year': identity.get('year') or item.get('year') or '',
+            'mb_release_id': identity.get('mb_release_id') or item.get('mb_release_id') or '',
+            'mb_releasegroup_id': identity.get('mb_releasegroup_id') or item.get('mb_releasegroup_id') or '',
+            'identity_confidence': identity.get('identity_confidence') or item.get('identity_confidence') or '',
+            'track_count': identity.get('track_count') or item.get('track_count'),
+            'notes': notes,
+        })
+
+        width_raw = item.get('width')
+        height_raw = item.get('height')
+        width_value = None if width_raw in (None, '', 'Missing') else width_raw
+        height_value = None if height_raw in (None, '', 'Missing') else height_raw
+        requires_action = bool(item.get('requires_action'))
+        current_status = 'needs_review' if requires_action else 'already_good'
+        status, status_reason = evaluate_album_state(
+            width_value,
+            height_value,
+            notes,
+            current_status=current_status,
+            candidate_count=0,
+            target_size=target_size,
+            preserve_user_terminal=False,
+        )
+        if requires_action and status == 'already_good':
+            status = 'needs_review'
+            status_reason = 'artwork needs review'
+        merged_notes = dict(identity.get('notes') or {})
+        merged_notes.update(status_reason_note(status, status_reason))
+        identity['notes'] = merged_notes
+
+        example = str(item.get('example_file') or '')
+        db.upsert_album(
+            key, artist, album, album_path, status=status,
+            width=width_value, height=height_value, example_file=example, meta=identity,
+        )
+        if requires_action and key not in seen_keys:
+            row = (
+                artist,
+                album,
+                width_value or 'Missing',
+                height_value or 'Missing',
+                example,
+                album_path,
+                key,
+                identity,
+            )
+            rows.append(row)
+            seen_keys.add(key)
+            if on_album:
+                info = {
+                    'artist': artist,
+                    'album': album,
+                    'album_path': album_path,
+                    'album_key': key,
+                    'search_artist': identity.get('search_artist', artist),
+                    'search_album': identity.get('search_album', album),
+                    'year': identity.get('year', ''),
+                    'mb_release_id': identity.get('mb_release_id', ''),
+                    'mb_releasegroup_id': identity.get('mb_releasegroup_id', ''),
+                    'identity_confidence': identity.get('identity_confidence', ''),
+                    'notes': identity.get('notes', {}),
+                }
+                on_album(row, info, len(rows))
+    return rows
+
+
 def write_low_res_csv(rows):
     path = REPORT_DIR / f'low_res_artwork_folders_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
     with open(path, 'w', newline='', encoding='utf-8') as f:

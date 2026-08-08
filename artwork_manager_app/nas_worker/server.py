@@ -8,14 +8,17 @@ instead of through SMB/VPN.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
+import re
 import shutil
 import threading
 import time
 import unicodedata
 import uuid
-from collections import deque
+from collections import Counter, deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -27,16 +30,17 @@ from mutagen.id3 import ID3, APIC, ID3NoHeaderError
 from mutagen.flac import FLAC, Picture
 from mutagen.mp4 import MP4, MP4Cover
 
-WORKER_BUILD = '4.53'
-APP_BUILD = '4.53'
-WORKER_API = 2
-MINIMUM_MAC_APP_WORKER_API = 2
+WORKER_BUILD = '5.04'
+APP_BUILD = '5.04'
+WORKER_API = 3
+MINIMUM_MAC_APP_WORKER_API = 3
 VERSION = f'Artwork Manager NAS Worker {WORKER_BUILD} / app build {APP_BUILD}'
 MUSIC_EXTENSIONS = ('.mp3', '.flac', '.m4a', '.mp4')
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp')
+YEAR_RE = re.compile(r'(19|20)\d{2}')
 UPDATE_HINT = (
     'If this is not the build you expected, Synology is probably still running '
-    'an older cached Docker image/container. Rebuild the project/image; do not only restart it. Build 4.53 also fixes Unicode-normalized NAS paths for accented folder names.'
+    'an older cached Docker image/container. Rebuild the project/image; do not only restart it. Build 5.04 adds NAS-local library scanning for VPN use.'
 )
 
 
@@ -196,7 +200,7 @@ def status_payload(public: bool = False) -> Dict[str, Any]:
         'active_jobs': active,
         'recent_jobs': recent,
         'recent_job_count': len(recent),
-        'endpoints': ['GET /', 'GET /version', 'GET /health', 'GET /status', 'POST /embed', 'POST /deep-check', 'POST /path-check'],
+        'endpoints': ['GET /', 'GET /version', 'GET /health', 'GET /status', 'POST /scan-library', 'POST /embed', 'POST /deep-check', 'POST /path-check'],
         'update_hint': UPDATE_HINT,
         'build_marker': f'amw-worker-{WORKER_BUILD}-api-{WORKER_API}',
     }
@@ -287,6 +291,332 @@ def safe_path(value: str) -> Path:
             raise ValueError(f'Path resolves outside allowed music roots: {final}')
         return final
     raise ValueError(f'Path is outside allowed music roots: {p}')
+
+
+def alpha_key(name: Any):
+    parts = re.split(r'(\d+)', str(name or '').lower())
+    return [int(part) if part.isdigit() else part for part in parts]
+
+
+def sort_names(names):
+    try:
+        return sorted(list(names), key=alpha_key)
+    except Exception:
+        return list(names)
+
+
+def path_resume_key(path: Any) -> str:
+    try:
+        return os.path.normcase(os.path.abspath(os.path.normpath(str(path or ''))))
+    except Exception:
+        return str(path or '')
+
+
+def clean_album_name(name: str) -> str:
+    name = str(name or '')
+    name = re.sub(r'^\(\d{4}\)\s*-\s*', '', name)
+    name = re.sub(r'^\d{4}\s*-\s*', '', name)
+    return name.strip()
+
+
+def normalize_for_match(name: str) -> str:
+    name = clean_album_name(name).lower()
+    name = re.sub(r'[^a-z0-9]+', ' ', name)
+    return ' '.join(name.split())
+
+
+def as_text_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def tag_values(tags: Any, *keys: str) -> List[str]:
+    vals = []
+    for key in keys:
+        try:
+            value = tags.get(key)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        vals.extend(as_text_list(value))
+    return vals
+
+
+def id3_text(audio: Any, *frame_ids: str) -> List[str]:
+    out = []
+    for frame_id in frame_ids:
+        frame = audio.get(frame_id)
+        if frame is None:
+            continue
+        text = getattr(frame, 'text', None)
+        out.extend(as_text_list(text if text is not None else str(frame)))
+    return out
+
+
+def id3_txxx(audio: Any, *descriptions: str) -> List[str]:
+    wanted = {d.lower() for d in descriptions}
+    out = []
+    for key, frame in audio.items():
+        if not str(key).startswith('TXXX'):
+            continue
+        desc = str(getattr(frame, 'desc', '') or '').lower()
+        if desc in wanted:
+            out.extend(as_text_list(getattr(frame, 'text', None)))
+    return out
+
+
+def mp4_values(tags: Any, *keys: str) -> List[str]:
+    out = []
+    for key in keys:
+        value = tags.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, bytes):
+                    try:
+                        item = item.decode('utf-8', errors='ignore')
+                    except Exception:
+                        item = ''
+                out.extend(as_text_list(item))
+        else:
+            out.extend(as_text_list(value))
+    return out
+
+
+def read_track_metadata(path: Path) -> Dict[str, List[str]]:
+    ext = path.suffix.lower()
+    data = {
+        'artist': [], 'albumartist': [], 'album': [], 'year': [],
+        'mb_release_id': [], 'mb_releasegroup_id': [],
+    }
+    try:
+        if ext == '.mp3':
+            audio = ID3(str(path))
+            data['artist'].extend(id3_text(audio, 'TPE1'))
+            data['albumartist'].extend(id3_text(audio, 'TPE2'))
+            data['album'].extend(id3_text(audio, 'TALB'))
+            data['year'].extend(id3_text(audio, 'TDRC', 'TDOR', 'TYER', 'TDAT'))
+            data['mb_release_id'].extend(id3_txxx(audio, 'MusicBrainz Album Id', 'MusicBrainz Release Id', 'MusicBrainz AlbumID'))
+            data['mb_releasegroup_id'].extend(id3_txxx(audio, 'MusicBrainz Release Group Id', 'MusicBrainz Release GroupID'))
+        elif ext == '.flac':
+            audio = FLAC(str(path))
+            tags = audio.tags or {}
+            data['artist'].extend(tag_values(tags, 'artist'))
+            data['albumartist'].extend(tag_values(tags, 'albumartist', 'album artist'))
+            data['album'].extend(tag_values(tags, 'album'))
+            data['year'].extend(tag_values(tags, 'date', 'year', 'originaldate', 'originalyear'))
+            data['mb_release_id'].extend(tag_values(tags, 'musicbrainz_albumid', 'musicbrainz release id'))
+            data['mb_releasegroup_id'].extend(tag_values(tags, 'musicbrainz_releasegroupid', 'musicbrainz release group id'))
+        elif ext in ('.m4a', '.mp4'):
+            audio = MP4(str(path))
+            tags = audio.tags or {}
+            data['artist'].extend(mp4_values(tags, '©ART'))
+            data['albumartist'].extend(mp4_values(tags, 'aART'))
+            data['album'].extend(mp4_values(tags, '©alb'))
+            data['year'].extend(mp4_values(tags, '©day'))
+            data['mb_release_id'].extend(mp4_values(tags, '----:com.apple.iTunes:MusicBrainz Album Id', '----:com.apple.iTunes:MusicBrainz Release Id'))
+            data['mb_releasegroup_id'].extend(mp4_values(tags, '----:com.apple.iTunes:MusicBrainz Release Group Id'))
+    except Exception:
+        pass
+    return data
+
+
+def common_value(values: List[str]) -> str:
+    values = [str(v).strip() for v in values if str(v).strip()]
+    if not values:
+        return ''
+    return Counter(values).most_common(1)[0][0]
+
+
+def parse_folder_identity(folder: Path, library_root: Path) -> Dict[str, str]:
+    rel = os.path.relpath(str(folder), str(library_root))
+    parts = rel.split(os.sep)
+    artist = parts[0] if len(parts) >= 1 and parts[0] != '.' else ''
+    album_part = parts[1] if len(parts) >= 2 else (parts[0] if parts and parts[0] != '.' else '')
+    year = ''
+    album = album_part
+    match = re.match(r'^\((\d{4})\)\s*-\s*(.+)$', album_part)
+    if match:
+        year, album = match.group(1), match.group(2)
+    else:
+        match = re.match(r'^(\d{4})\s*-\s*(.+)$', album_part)
+        if match:
+            year, album = match.group(1), match.group(2)
+        else:
+            match = re.match(r'^(.+?)\s*\((\d{4})\)$', album_part)
+            if match:
+                album, year = match.group(1), match.group(2)
+    return {
+        'folder_artist': artist.strip(),
+        'folder_album': clean_album_name(album).strip(),
+        'folder_year': year,
+    }
+
+
+def inspect_album_identity(folder: Path, library_root: Path, music_names: List[str]) -> Dict[str, Any]:
+    folder_meta = parse_folder_identity(folder, library_root)
+    tag_artists: List[str] = []
+    tag_albumartists: List[str] = []
+    tag_albums: List[str] = []
+    tag_years: List[str] = []
+    mb_release_ids: List[str] = []
+    mb_releasegroup_ids: List[str] = []
+    for name in music_names[:10]:
+        meta = read_track_metadata(folder / name)
+        tag_artists.extend(meta.get('artist', []))
+        tag_albumartists.extend(meta.get('albumartist', []))
+        tag_albums.extend(meta.get('album', []))
+        tag_years.extend(meta.get('year', []))
+        mb_release_ids.extend(meta.get('mb_release_id', []))
+        mb_releasegroup_ids.extend(meta.get('mb_releasegroup_id', []))
+
+    artist_from_tags = common_value(tag_albumartists) or common_value(tag_artists)
+    album_from_tags = common_value(tag_albums)
+    year_from_tags = common_value([YEAR_RE.search(v).group(0) for v in tag_years if YEAR_RE.search(v)])
+    search_artist = artist_from_tags or folder_meta['folder_artist']
+    search_album = album_from_tags or folder_meta['folder_album']
+    year = year_from_tags or folder_meta['folder_year'] or ''
+    artist_agree = not (artist_from_tags and folder_meta['folder_artist']) or normalize_for_match(artist_from_tags) == normalize_for_match(folder_meta['folder_artist'])
+    album_agree = not (album_from_tags and folder_meta['folder_album']) or normalize_for_match(album_from_tags) == normalize_for_match(folder_meta['folder_album'])
+    if artist_from_tags and album_from_tags and artist_agree and album_agree:
+        confidence = 'High'
+        source_summary = 'tags + folder agreement'
+    elif (artist_from_tags or album_from_tags) and (artist_agree or album_agree):
+        confidence = 'Medium'
+        source_summary = 'tags supported by folder structure'
+    elif search_artist or search_album:
+        confidence = 'Low'
+        source_summary = 'folder structure and partial tags'
+    else:
+        confidence = 'Low'
+        source_summary = 'weak metadata'
+    if (artist_from_tags and folder_meta['folder_artist'] and not artist_agree) or (album_from_tags and folder_meta['folder_album'] and not album_agree):
+        source_summary = 'tags/folder mismatch'
+        confidence = 'Low'
+    return {
+        'artist': search_artist or folder_meta['folder_artist'],
+        'album': search_album or folder_meta['folder_album'],
+        'search_artist': search_artist or folder_meta['folder_artist'],
+        'search_album': search_album or folder_meta['folder_album'],
+        'year': year,
+        'mb_release_id': common_value(mb_release_ids),
+        'mb_releasegroup_id': common_value(mb_releasegroup_ids),
+        'identity_confidence': confidence,
+        'track_count': len(music_names),
+        'notes': {
+            'source_summary': source_summary,
+            'folder_artist': folder_meta['folder_artist'],
+            'folder_album': folder_meta['folder_album'],
+            'folder_year': folder_meta['folder_year'],
+            'tag_artist': artist_from_tags,
+            'tag_album': album_from_tags,
+            'tag_year': year_from_tags,
+        },
+    }
+
+
+def get_album_path(folder: Path, library_root: Path) -> Path:
+    rel = os.path.relpath(str(folder), str(library_root))
+    parts = rel.split(os.sep)
+    return library_root / parts[0] / parts[1] if len(parts) >= 2 else folder
+
+
+def folder_music_fingerprint(folder: Path, music_names: List[str]) -> Dict[str, Any]:
+    parts = []
+    total_size = 0
+    max_mtime_ns = 0
+    for name in sort_names(music_names or []):
+        try:
+            st = (folder / name).stat()
+            size = int(getattr(st, 'st_size', 0) or 0)
+            mtime_ns = int(getattr(st, 'st_mtime_ns', int(getattr(st, 'st_mtime', 0) * 1000000000)) or 0)
+        except Exception:
+            size = -1
+            mtime_ns = -1
+        total_size += max(0, size)
+        max_mtime_ns = max(max_mtime_ns, mtime_ns)
+        parts.append(f'{name}\0{size}\0{mtime_ns}')
+    digest = hashlib.sha1('\0'.join(parts).encode('utf-8', errors='ignore')).hexdigest()
+    return {
+        'version': 1,
+        'file_count': len(music_names or []),
+        'total_size': total_size,
+        'max_mtime_ns': max_mtime_ns,
+        'digest': digest,
+    }
+
+
+def fingerprint_matches(saved: Any, current: Any) -> bool:
+    if not isinstance(saved, dict) or not isinstance(current, dict):
+        return False
+    return (
+        int(saved.get('version') or 0) == int(current.get('version') or 0) and
+        int(saved.get('file_count') or -1) == int(current.get('file_count') or -2) and
+        int(saved.get('total_size') or -1) == int(current.get('total_size') or -2) and
+        int(saved.get('max_mtime_ns') or -1) == int(current.get('max_mtime_ns') or -2) and
+        str(saved.get('digest') or '') == str(current.get('digest') or '')
+    )
+
+
+def target_tolerance(mode: Any) -> float:
+    return 1.0 if str(mode or '').strip().lower() == 'strict' else 0.98
+
+
+def scan_artwork_meets_target_size(width: Any, height: Any, target_size: Any, tolerance: float = 1.0) -> bool:
+    try:
+        w, h, target = int(width or 0), int(height or 0), int(target_size or 0)
+    except Exception:
+        return False
+    if target <= 0:
+        return True
+    if w <= 0 or h <= 0:
+        return False
+    if w >= target and h >= target:
+        return True
+    if max(w, h) >= target and min(w, h) >= int(round(target * float(tolerance or 1.0))):
+        return True
+    return False
+
+
+def image_dimensions_path(path: Path):
+    try:
+        with Image.open(path) as img:
+            return img.size
+    except Exception:
+        return None
+
+
+def album_folder_cover_status(album_path: Path, target_size: int, folder_files: List[str] | None, tolerance: float) -> Dict[str, Any]:
+    candidate_names = ('cover.jpg', 'cover.jpeg', 'cover.png', 'cover.webp')
+    if folder_files is not None:
+        by_lower = {str(name).lower(): str(name) for name in folder_files}
+        existing_name = next((by_lower.get(name) for name in candidate_names if by_lower.get(name)), '')
+        existing = album_path / existing_name if existing_name else None
+    else:
+        if not album_path.is_dir():
+            return {'ok': False, 'issue': 'album folder unavailable', 'path': ''}
+        existing = next((album_path / name for name in candidate_names if (album_path / name).is_file()), None)
+    if not existing:
+        return {'ok': False, 'issue': 'folder cover missing', 'path': ''}
+    dims = image_dimensions_path(existing)
+    try:
+        compat = image_format_info(existing.read_bytes())
+    except Exception as exc:
+        compat = {'compatible': False, 'issue': f'cannot read file: {exc}'}
+    if existing.suffix.lower() != '.jpg':
+        return {'ok': False, 'issue': f'folder cover is {existing.suffix.lstrip(".").upper() or "non-JPG"}', 'path': str(existing), 'dimensions': dims}
+    if not compat.get('compatible'):
+        return {'ok': False, 'issue': f'folder cover {compat.get("issue") or "not baseline JPEG"}', 'path': str(existing), 'dimensions': dims}
+    if not dims:
+        return {'ok': False, 'issue': 'folder cover unreadable', 'path': str(existing)}
+    if not scan_artwork_meets_target_size(dims[0], dims[1], target_size, tolerance):
+        return {'ok': False, 'issue': f'folder cover below target ({dims[0]}×{dims[1]})', 'path': str(existing), 'dimensions': dims}
+    return {'ok': True, 'issue': '', 'path': str(existing), 'dimensions': dims}
 
 
 def iter_music_files(album_folder: Path):
@@ -515,11 +845,11 @@ def embed_album_job(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def artwork_meets_target_size(w: int, h: int, target: int) -> bool:
-    return int(w or 0) >= int(target or 0) and int(h or 0) >= int(target or 0)
+def artwork_meets_target_size(w: int, h: int, target: int, tolerance: float = 1.0) -> bool:
+    return scan_artwork_meets_target_size(w, h, target, tolerance)
 
 
-def deep_check(album_folder: Path, target_size: int, problem_files: bool = False) -> Dict[str, Any]:
+def deep_check(album_folder: Path, target_size: int, problem_files: bool = False, tolerance: float = 1.0) -> Dict[str, Any]:
     files = list(iter_music_files(album_folder))
     result = {
         'enabled': True,
@@ -606,7 +936,7 @@ def deep_check(album_folder: Path, target_size: int, problem_files: bool = False
             result['example_width'] = w
             result['example_height'] = h
         file_not_square = (w != h)
-        file_below = not artwork_meets_target_size(w, h, target_size)
+        file_below = not artwork_meets_target_size(w, h, target_size, tolerance)
         if file_not_square:
             result['non_square_count'] += 1
             if not result['first_non_square_file']:
@@ -623,6 +953,258 @@ def deep_check(album_folder: Path, target_size: int, problem_files: bool = False
             problems.append({'file': fn, 'dimensions': dims, 'issues': issues})
     result['requires_action'] = bool(result['missing_count'] or result['below_target_count'] or result['non_square_count'] or result['incompatible_count'] or result['unreadable_count'])
     return {'deep_file_check': result, 'problem_files': problems}
+
+
+def deep_check_summary(check: Dict[str, Any]) -> str:
+    if not check:
+        return ''
+    bits = []
+    checked = int(check.get('checked_files') or 0)
+    if check.get('missing_count'):
+        bits.append(f"{check.get('missing_count')}/{checked} missing")
+    if check.get('below_target_count'):
+        bits.append(f"{check.get('below_target_count')}/{checked} below target")
+    if check.get('non_square_count'):
+        bits.append(f"{check.get('non_square_count')}/{checked} not square")
+    if check.get('incompatible_count'):
+        bits.append(f"{check.get('incompatible_count')}/{checked} not baseline")
+    if check.get('unreadable_count'):
+        bits.append(f"{check.get('unreadable_count')}/{checked} unreadable")
+    return '; '.join(bits) or f'{checked} file(s) OK'
+
+
+def analyze_scan_album(
+    folder: Path,
+    library_root: Path,
+    files: List[str],
+    music: List[str],
+    fingerprint: Dict[str, Any],
+    settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    include_missing = bool(settings.get('include_missing', True))
+    deep_scan_enabled = bool(settings.get('deep_scan_all_files'))
+    scan_min = int(settings.get('scan_min_artwork_size') or 1000)
+    preferred = int(settings.get('preferred_artwork_size') or scan_min or 1000)
+    min_artwork_size = preferred if deep_scan_enabled else scan_min
+    tolerance = target_tolerance(settings.get('target_size_match_mode'))
+    identity = inspect_album_identity(folder, library_root, music)
+    notes = dict(identity.get('notes') or {})
+    notes['scan_fingerprint'] = fingerprint
+    identity['notes'] = notes
+    artist = str(identity.get('artist') or '')
+    album = str(identity.get('album') or '')
+    album_path = get_album_path(folder, library_root)
+
+    album_low = False
+    album_incompatible = False
+    album_not_square = False
+    folder_cover_issue = ''
+    folder_cover_status: Dict[str, Any] | None = None
+    compatibility_issue = ''
+    example = ''
+    dims: Tuple[Any, Any] = (None, None)
+
+    if deep_scan_enabled:
+        deep = deep_check(folder, preferred, problem_files=False, tolerance=tolerance).get('deep_file_check') or {}
+        notes = dict(identity.get('notes') or {})
+        notes['deep_file_check'] = deep
+        identity['notes'] = notes
+        example = deep.get('first_issue_file') or deep.get('example_file') or (music[0] if music else '')
+        dims = (
+            deep.get('example_width') or deep.get('min_width'),
+            deep.get('example_height') or deep.get('min_height'),
+        )
+        if deep.get('missing_count') or deep.get('unreadable_count'):
+            album_low = True
+            if deep.get('missing_count') and not dims[0]:
+                dims = (None, None)
+        if deep.get('below_target_count'):
+            album_low = True
+        if deep.get('non_square_count'):
+            album_not_square = True
+        if deep.get('incompatible_count'):
+            album_incompatible = True
+            compatibility_issue = deep_check_summary(deep) or 'embedded artwork needs conversion'
+    else:
+        for name in music:
+            arts = embedded_artwork(folder / name)
+            if not arts:
+                example = example or name
+                if include_missing:
+                    album_low = True
+                    dims = (None, None)
+                continue
+            for art in arts:
+                w, h = art['width'], art['height']
+                if dims == (None, None):
+                    dims = (w, h)
+                    example = example or name
+                if not scan_artwork_meets_target_size(w, h, min_artwork_size, tolerance):
+                    album_low = True
+                    example = name
+                    dims = (w, h)
+                    break
+                if w != h:
+                    album_not_square = True
+                    example = name
+                    dims = (w, h)
+                    break
+                if not art.get('compatible'):
+                    album_incompatible = True
+                    example = name
+                    dims = (w, h)
+                    compatibility_issue = art.get('compatibility_issue') or 'not baseline JPEG'
+                    break
+            if album_low or album_not_square or album_incompatible:
+                break
+
+    if settings.get('save_approved_artwork_to_album_folder'):
+        cover_files = files if path_resume_key(folder) == path_resume_key(album_path) else None
+        folder_cover_status = album_folder_cover_status(album_path, preferred, cover_files, tolerance)
+        if not folder_cover_status.get('ok'):
+            album_incompatible = True
+            folder_cover_issue = folder_cover_status.get('issue') or 'folder cover missing'
+            compatibility_issue = compatibility_issue or folder_cover_issue
+
+    notes = dict(identity.get('notes') or {})
+    if album_incompatible:
+        notes['artwork_compatibility'] = {
+            'issue': compatibility_issue or 'one or more files need baseline JPEG conversion',
+            'needs_conversion': True,
+            'format': compatibility_issue or 'scan check',
+        }
+    if folder_cover_issue:
+        notes['album_folder_cover'] = {
+            'needs_save': True,
+            'issue': folder_cover_issue,
+            'path': (folder_cover_status or {}).get('path') or '',
+            'checked_at': now(),
+        }
+    identity['notes'] = notes
+    requires_action = bool(album_low or album_not_square or album_incompatible)
+    return {
+        'artist': artist,
+        'album': album,
+        'album_path': str(album_path),
+        'search_artist': identity.get('search_artist') or artist,
+        'search_album': identity.get('search_album') or album,
+        'year': identity.get('year') or '',
+        'mb_release_id': identity.get('mb_release_id') or '',
+        'mb_releasegroup_id': identity.get('mb_releasegroup_id') or '',
+        'identity_confidence': identity.get('identity_confidence') or '',
+        'track_count': identity.get('track_count') or len(music),
+        'width': dims[0],
+        'height': dims[1],
+        'example_file': example or '',
+        'requires_action': requires_action,
+        'scan_fingerprint': fingerprint,
+        'identity': identity,
+    }
+
+
+def scan_library_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+    library_root = safe_path(payload.get('library_root') or '')
+    if not library_root.is_dir():
+        raise ValueError('Library root does not exist inside the container')
+    resume = bool(payload.get('resume', True))
+    deep_scan = bool(payload.get('deep_scan_all_files'))
+    settings = {
+        'include_missing': bool(payload.get('include_missing', True)),
+        'deep_scan_all_files': deep_scan,
+        'scan_min_artwork_size': int(payload.get('scan_min_artwork_size') or 1000),
+        'preferred_artwork_size': int(payload.get('preferred_artwork_size') or payload.get('scan_min_artwork_size') or 1000),
+        'target_size_match_mode': payload.get('target_size_match_mode') or 'Relaxed',
+        'save_approved_artwork_to_album_folder': bool(payload.get('save_approved_artwork_to_album_folder')),
+    }
+    known_by_path: Dict[str, Dict[str, Any]] = {}
+    if resume and not deep_scan:
+        for item in payload.get('known_albums') or []:
+            if not isinstance(item, dict):
+                continue
+            album_path = str(item.get('album_path') or '')
+            if not album_path:
+                continue
+            known_by_path[album_path] = item
+            known_by_path[path_resume_key(album_path)] = item
+
+    max_workers = max(1, min(int(payload.get('max_workers') or 4), 32))
+    if deep_scan:
+        max_workers = min(max_workers, 8)
+    max_pending = max(1, max_workers * 3)
+    max_albums = int(payload.get('max_albums') or 0)
+    submitted_paths = set()
+    albums: List[Dict[str, Any]] = []
+    fingerprint_updates: List[Dict[str, Any]] = []
+    processed = 0
+    skipped = 0
+    backfilled = 0
+
+    pending = set()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for root_text, dirs, files in os.walk(library_root):
+            dirs[:] = sort_names(dirs)
+            files = sort_names(files)
+            music = [name for name in files if str(name).lower().endswith(MUSIC_EXTENSIONS)]
+            if not music:
+                continue
+            folder = Path(root_text)
+            album_path = get_album_path(folder, library_root)
+            album_path_key = path_resume_key(album_path)
+            if album_path_key in submitted_paths:
+                continue
+            submitted_paths.add(album_path_key)
+            if max_albums and processed >= max_albums:
+                break
+            processed += 1
+
+            existing = known_by_path.get(str(album_path)) or known_by_path.get(album_path_key)
+            fingerprint = None
+            if existing and resume and not deep_scan:
+                saved_fingerprint = existing.get('scan_fingerprint')
+                fingerprint = folder_music_fingerprint(folder, music)
+                if saved_fingerprint:
+                    if fingerprint_matches(saved_fingerprint, fingerprint):
+                        skipped += 1
+                        continue
+                else:
+                    album_key = str(existing.get('album_key') or '')
+                    if album_key:
+                        fingerprint_updates.append({
+                            'fingerprint_update': True,
+                            'album_key': album_key,
+                            'album_path': str(album_path),
+                            'scan_fingerprint': fingerprint,
+                        })
+                    backfilled += 1
+                    continue
+            if fingerprint is None:
+                fingerprint = folder_music_fingerprint(folder, music)
+
+            pending.add(executor.submit(analyze_scan_album, folder, library_root, files, music, fingerprint, settings))
+            if len(pending) >= max_pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    albums.append(fut.result())
+
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                albums.append(fut.result())
+
+    albums.sort(key=lambda item: (str(item.get('artist') or '').lower(), str(item.get('album') or '').lower(), str(item.get('album_path') or '').lower()))
+    return {
+        'library_root': str(library_root),
+        'processed_albums': processed,
+        'changed_albums': len(albums),
+        'skipped_unchanged': skipped,
+        'fingerprints_backfilled': backfilled,
+        'albums': albums,
+        'fingerprint_updates': fingerprint_updates,
+        'worker_build': WORKER_BUILD,
+        'api': WORKER_API,
+        'worker_api': WORKER_API,
+        'source': 'nas-worker-scan',
+    }
 
 
 def path_check(album_folder: Path, requested_album_folder: str = '') -> Dict[str, Any]:
@@ -731,6 +1313,19 @@ class Handler(BaseHTTPRequestHandler):
                 album_folder = safe_path(payload.get('album_folder') or '')
                 result = path_check(album_folder, requested_album_folder=str(payload.get('album_folder') or ''))
                 self._send(200, {'ok': True, 'result': result, 'worker_build': WORKER_BUILD, 'api': WORKER_API, 'worker_api': WORKER_API})
+                return
+            if route == '/scan-library':
+                scan_payload = dict(payload)
+                scan_payload['album_folder'] = scan_payload.get('library_root') or ''
+                job_id, started_mono, _album = begin_job('scan-library', scan_payload)
+                result = scan_library_job(payload)
+                worker = finish_job(job_id, started_mono, True, result=result)
+                result['remote_worker'] = True
+                result['remote_worker_job_id'] = job_id
+                result['remote_worker_build'] = WORKER_BUILD
+                result['remote_worker_api'] = WORKER_API
+                result['remote_worker_duration_seconds'] = worker.get('duration_seconds')
+                self._send(200, {'ok': True, 'result': result, 'worker': worker})
                 return
             if route == '/embed':
                 job_id, started_mono, _album = begin_job('embed', payload)

@@ -16,10 +16,18 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .config import load_settings, get_nas_worker_enabled, get_nas_worker_timeout
+from .config import (
+    load_settings,
+    get_nas_worker_enabled,
+    get_nas_worker_timeout,
+    get_scan_min_artwork_size,
+    get_preferred_artwork_size,
+    get_deep_scan_all_files,
+    get_scan_worker_threads,
+)
 
-EXPECTED_NAS_WORKER_BUILD = '4.53'
-MIN_NAS_WORKER_API = 2
+EXPECTED_NAS_WORKER_BUILD = '5.04'
+MIN_NAS_WORKER_API = 3
 _COMPAT_CACHE_SECONDS = 300
 _COMPAT_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
 
@@ -136,6 +144,26 @@ def map_album_path_to_worker(album_path: str, settings: Optional[Dict[str, Any]]
             suffix = norm_path[len(prefix):].replace('\\', '/')
             return _unicode_nfc(remote_prefix + ('/' + suffix if suffix else ''))
     return ''
+
+
+def map_worker_path_to_local(worker_path: str, settings: Optional[Dict[str, Any]] = None) -> str:
+    """Return the Mac-visible path for a worker/container path."""
+    settings = settings or load_settings()
+    path = str(worker_path or '').strip()
+    if not path:
+        return ''
+    local_prefix = _strip_trailing_sep(settings.get('nas_worker_local_prefix') or '')
+    remote_prefix = _strip_trailing_sep(settings.get('nas_worker_remote_prefix') or '/music') or '/music'
+    if not local_prefix:
+        return path
+    norm_path = path.rstrip('/\\')
+    if norm_path == remote_prefix:
+        return _unicode_nfc(local_prefix)
+    prefix = remote_prefix + '/'
+    if norm_path.startswith(prefix):
+        suffix = norm_path[len(prefix):].replace('\\', '/')
+        return _unicode_nfc(local_prefix + ('/' + suffix if suffix else ''))
+    return path
 
 
 def worker_enabled_for_path(album_path: str, settings: Optional[Dict[str, Any]] = None) -> bool:
@@ -352,7 +380,7 @@ def worker_path_check(album_folder: str, settings: Optional[Dict[str, Any]] = No
     """Ask the worker whether one mapped album path exists/readable/writable.
 
     This uses the optional /path-check endpoint.  Older
-    workers should be rebuilt to 4.53 so Settings can verify the exact path
+    workers should be rebuilt to 5.04 so Settings can verify the exact path
     mapping before write jobs run.
     """
     settings = settings or load_settings()
@@ -384,3 +412,78 @@ def deep_check_album_remote(album_folder: str, *, target_size: Optional[int] = N
     out['remote_worker_job_id'] = out.get('_worker_job_id') or ''
     out['remote_worker_build'] = out.get('_worker_build') or ''
     return out
+
+
+def _known_scan_albums(settings: Dict[str, Any]) -> list[Dict[str, Any]]:
+    try:
+        from . import database as db
+        resume_info = db.existing_album_resume_info()
+    except Exception:
+        resume_info = {}
+    seen = set()
+    out = []
+    for info in (resume_info or {}).values():
+        if not isinstance(info, dict):
+            continue
+        album_key = str(info.get('album_key') or '').strip()
+        album_path = str(info.get('album_path') or '').strip()
+        remote_path = map_album_path_to_worker(album_path, settings)
+        if not album_key or not remote_path:
+            continue
+        dedupe = (album_key, remote_path)
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        out.append({
+            'album_key': album_key,
+            'album_path': remote_path,
+            'scan_fingerprint': info.get('scan_fingerprint') if isinstance(info.get('scan_fingerprint'), dict) else None,
+        })
+    return out
+
+
+def scan_library_remote(
+    library_root: str,
+    *,
+    include_missing: bool = True,
+    resume: bool = True,
+    settings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Ask the NAS worker to walk/check the library locally on the NAS."""
+    settings = settings or load_settings()
+    ensure_worker_compatible(settings)
+    remote_root = map_album_path_to_worker(library_root, settings)
+    if not remote_root:
+        raise RemoteWorkerError('Library path does not match the NAS worker path mapping.')
+    deep_scan = get_deep_scan_all_files(settings)
+    payload = {
+        'library_root': remote_root,
+        'include_missing': bool(include_missing),
+        'resume': bool(resume),
+        'deep_scan_all_files': bool(deep_scan),
+        'scan_min_artwork_size': get_scan_min_artwork_size(settings),
+        'preferred_artwork_size': get_preferred_artwork_size(settings),
+        'target_size_match_mode': str(settings.get('target_size_match_mode') or 'Relaxed'),
+        'save_approved_artwork_to_album_folder': bool(settings.get('save_approved_artwork_to_album_folder', False)),
+        'max_workers': get_scan_worker_threads(settings),
+        'known_albums': [] if deep_scan or not resume else _known_scan_albums(settings),
+    }
+    out = _post('/scan-library', payload, settings=settings, timeout=get_nas_worker_timeout(settings))
+    result = out.get('result') if isinstance(out.get('result'), dict) else out
+    albums = []
+    for item in result.get('albums') or []:
+        if not isinstance(item, dict):
+            continue
+        mapped = dict(item)
+        remote_album = str(mapped.get('album_path') or '')
+        mapped['remote_album_path'] = remote_album
+        mapped['album_path'] = map_worker_path_to_local(remote_album, settings)
+        albums.append(mapped)
+    result['albums'] = albums
+    result['remote_library_root'] = remote_root
+    result['local_library_root'] = library_root
+    result['remote_worker'] = True
+    result['remote_worker_duration_seconds'] = out.get('_worker_duration_seconds') or out.get('_request_duration_seconds')
+    result['remote_worker_job_id'] = out.get('_worker_job_id') or ''
+    result['remote_worker_build'] = out.get('_worker_build') or result.get('worker_build') or ''
+    return result

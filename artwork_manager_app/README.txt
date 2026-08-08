@@ -1,5 +1,7 @@
-Build 5.03 — Qt friendlier cover wording
+Build 5.04 — NAS worker library scan
 
+- Scan / Resume can now hand the folder walk and artwork checks to NAS Worker 5.04, avoiding thousands of SMB/VPN file checks from the Mac.
+- The NAS scan returns compact queue results and unchanged-folder fingerprints for the Mac app to store locally.
 - The Qt review workflow now uses simpler cover-focused labels such as Find Cover, Use This Cover, Reject Cover, and Fix Current Cover.
 - The bottom action row now hides candidate-only and inactive actions until they are useful.
 - Added a calm empty-state card to the artwork options list when an album has no saved candidate covers.

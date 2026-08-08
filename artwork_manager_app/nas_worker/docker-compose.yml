@@ -3,7 +3,7 @@ services:
     # The explicit image tag makes it obvious which worker build Synology should be running.
     # Important: after copying new files to the NAS, rebuild the project/image. A restart alone
     # can keep serving an older cached image.
-    image: artwork-manager-worker:4.53
+    image: artwork-manager-worker:5.04
     build:
       context: .
     container_name: artwork-manager-worker

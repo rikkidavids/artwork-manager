@@ -92,7 +92,7 @@ from .config import (
     save_settings,
 )
 from .review_queue import build_candidates, google_images_url, manual_import
-from .remote_worker import check_worker, deep_check_album_remote, worker_enabled_for_path, worker_status, worker_update_hint
+from .remote_worker import check_worker, deep_check_album_remote, scan_library_remote, worker_enabled_for_path, worker_status, worker_update_hint
 from .providers.deezer import DeezerProvider
 from .providers.discogs import DiscogsProvider
 from .providers.itunes import ITunesProvider
@@ -103,6 +103,7 @@ from .scanner import (
     deep_check_album_problem_files,
     embedded_artwork,
     inspect_album_identity,
+    apply_remote_scan_results,
     scan_library,
     write_low_res_csv,
 )
@@ -1555,6 +1556,10 @@ class LibraryScanWorker(QThread):
         rows = []
         try:
             db.start_scan(self.library_root, 0)
+            try:
+                settings = load_settings()
+            except Exception:
+                settings = {}
 
             def progress(done: int, total: int, path: str) -> None:
                 self.progress.emit(int(done or 0), int(total or 0), str(path or ''))
@@ -1567,19 +1572,47 @@ class LibraryScanWorker(QThread):
                     'album_key': info.get('album_key'),
                 })
 
-            scan_library(
-                self.library_root,
-                include_missing=True,
-                progress=progress,
-                stop_event=self.stop_event,
-                on_album=on_album,
-                total_albums=0,
-                resume=True,
-            )
+            remote_result = {}
+            if worker_enabled_for_path(self.library_root, settings):
+                self.progress.emit(0, 0, 'NAS worker scanning library locally...')
+                remote_result = scan_library_remote(
+                    self.library_root,
+                    include_missing=True,
+                    resume=True,
+                    settings=settings,
+                )
+                if self.stop_event.is_set():
+                    db.finish_scan(stopped=True)
+                    self.completed.emit({'stopped': True, 'queued': 0, 'csv': '', 'remote_worker': True})
+                    return
+                target = get_preferred_artwork_size(settings) if get_deep_scan_all_files(settings) else get_scan_min_artwork_size(settings)
+                remote_items = list(remote_result.get('fingerprint_updates') or []) + list(remote_result.get('albums') or [])
+                rows = apply_remote_scan_results(remote_items, min_artwork_size=target, on_album=on_album)
+                db.update_scan_progress(int(remote_result.get('processed_albums') or 0), 0)
+            else:
+                scan_library(
+                    self.library_root,
+                    include_missing=True,
+                    progress=progress,
+                    stop_event=self.stop_event,
+                    on_album=on_album,
+                    total_albums=0,
+                    resume=True,
+                )
             stopped = self.stop_event.is_set()
             db.finish_scan(stopped=stopped)
             csv_path = write_low_res_csv(rows) if rows else ''
-            self.completed.emit({'stopped': stopped, 'queued': len(rows), 'csv': csv_path})
+            payload = {'stopped': stopped, 'queued': len(rows), 'csv': csv_path}
+            if remote_result:
+                payload.update({
+                    'remote_worker': True,
+                    'processed': int(remote_result.get('processed_albums') or 0),
+                    'changed': int(remote_result.get('changed_albums') or 0),
+                    'skipped': int(remote_result.get('skipped_unchanged') or 0),
+                    'backfilled': int(remote_result.get('fingerprints_backfilled') or 0),
+                    'remote_worker_duration_seconds': remote_result.get('remote_worker_duration_seconds'),
+                })
+            self.completed.emit(payload)
         except Exception as exc:
             try:
                 db.finish_scan(stopped=self.stop_event.is_set())
@@ -2173,13 +2206,18 @@ class ScanDialog(QDialog):
 
     def start_scan(self) -> None:
         folder = self.path_edit.text().strip()
-        if not folder or not os.path.isdir(folder):
+        try:
+            settings = load_settings()
+        except Exception:
+            settings = self.settings
+        remote_possible = bool(folder and worker_enabled_for_path(folder, settings))
+        if not folder or (not os.path.isdir(folder) and not remote_possible):
             QMessageBox.warning(self, 'Folder not found', 'Choose a valid music folder first.')
             return
         if self.worker is not None and self.worker.isRunning():
             return
         save_settings({'last_library_path': folder})
-        self.settings = load_settings()
+        self.settings = settings
         self.queued_count = 0
         self.status_label.setText('Scanning library...')
         self.progress.setRange(0, 0)
@@ -2226,6 +2264,16 @@ class ScanDialog(QDialog):
             message = f'Scan stopped. {queued:,} album(s) queued.'
         else:
             message = f'Scan complete. {queued:,} album(s) queued.'
+        if result.get('remote_worker'):
+            processed = int(result.get('processed') or 0)
+            skipped = int(result.get('skipped') or 0)
+            backfilled = int(result.get('backfilled') or 0)
+            label = 'NAS scan stopped' if result.get('stopped') else 'NAS scan complete'
+            message = f'{label}. {queued:,} album(s) queued from {processed:,} folder(s).'
+            if skipped:
+                message += f' {skipped:,} unchanged skipped.'
+            if backfilled:
+                message += f' {backfilled:,} fingerprinted for next time.'
         csv_path = _text(result.get('csv'))
         if csv_path:
             message += f' Report saved: {_path_tail(csv_path, parts=2)}'

@@ -7,7 +7,8 @@ import sys
 import urllib.error
 import urllib.request
 
-MIN_API = 2
+EXPECTED_BUILD = '5.04'
+MIN_API = 3
 
 
 def fetch(url: str, token: str = ''):
@@ -40,14 +41,18 @@ def main() -> int:
     print(f"worker_build: {root.get('worker_build')!r}")
     print(f"api: {root.get('api')!r}")
     print(f"version: {root.get('version')!r}")
-    if root.get('worker_build') != '4.53':
-        print('WARNING: expected worker_build 4.53. Rebuild/recreate the Synology Docker project/image, do not only restart it.')
+    if root.get('worker_build') != EXPECTED_BUILD:
+        print(f'WARNING: expected worker_build {EXPECTED_BUILD}. Rebuild/recreate the Synology Docker project/image, do not only restart it.')
     try:
         api = int(root.get('api') or 0)
     except Exception:
         api = 0
     if api < MIN_API:
         print(f'ERROR: worker API {api or "unknown"} is older than required API {MIN_API}.')
+        return 1
+    endpoints = root.get('endpoints') or []
+    if not any('/scan-library' in str(endpoint) for endpoint in endpoints):
+        print('ERROR: worker does not advertise POST /scan-library. Rebuild/recreate the worker project.')
         return 1
 
     if token:

@@ -12,7 +12,7 @@ else
   exit 1
 fi
 
-echo "Artwork Manager NAS Worker 4.53 rebuild/update"
+echo "Artwork Manager NAS Worker 5.04 rebuild/update"
 echo "Project folder: $(pwd)"
 echo "This rebuilds the image and recreates the container. A plain restart is not enough after code changes."
 
@@ -33,4 +33,4 @@ echo
 echo "From your Mac, check:"
 echo "  http://YOUR-NAS-IP:8765/"
 echo
-echo "You should see worker_build 4.53 and api 2. If not, Synology is still serving an older container/image."
+echo "You should see worker_build 5.04 and api 3. If not, Synology is still serving an older container/image."
