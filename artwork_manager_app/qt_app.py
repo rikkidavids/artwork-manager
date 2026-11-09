@@ -99,6 +99,7 @@ from .providers.itunes import ITunesProvider
 from .providers.musicbrainz import MusicBrainzProvider
 from .scanner import (
     _deep_check_album_files,
+    album_music_relpaths,
     analyze_album_folder,
     deep_check_album_problem_files,
     embedded_artwork,
@@ -1242,13 +1243,9 @@ class AlbumDeepCheckWorker(QThread):
                 if not os.path.isdir(album_path):
                     raise ValueError('The selected album folder could not be found.')
                 try:
-                    names = sorted(os.listdir(album_path), key=lambda item: item.lower())
+                    music = album_music_relpaths(album_path)
                 except Exception as exc:
                     raise ValueError(f'Could not read the selected album folder: {exc}') from exc
-                music = [
-                    name for name in names
-                    if os.path.isfile(os.path.join(album_path, name)) and name.lower().endswith(MUSIC_EXTENSIONS)
-                ]
                 deep = _deep_check_album_files(album_path, music, target)
                 deep['source'] = 'mac-local'
                 rows = deep_check_album_problem_files(album_path, target_size=target, limit=500)
@@ -6330,6 +6327,10 @@ class QtArtworkWindow(QMainWindow):
             return
         if self.undo_worker is not None and self.undo_worker.isRunning():
             QMessageBox.information(self, 'Undo still running', 'Wait for the last-embed undo to finish before closing Artwork Manager.')
+            event.ignore()
+            return
+        if self.approval_worker is not None and self.approval_worker.isRunning():
+            QMessageBox.information(self, 'Still saving artwork', 'Artwork is still being written to your music files. Wait for it to finish before closing Artwork Manager, so no tracks are left half-written.')
             event.ignore()
             return
         if self.convert_worker is not None and self.convert_worker.isRunning():
