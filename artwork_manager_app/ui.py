@@ -7,7 +7,7 @@ from tkinter import ttk, filedialog, messagebox, simpledialog
 from PIL import Image, ImageTk, ImageFilter, ImageOps
 from .config import APP_DIR, BUILD_VERSION, MIN_ARTWORK_SIZE, APPROVED_DIR, REPORT_DIR, BACKUP_DIR, PREVIEW_CACHE_DIR, TEMP_DIR, IMPORT_DIR, DATA_DIR, DB_PATH, load_settings, save_settings, get_scan_min_artwork_size, get_fetch_min_artwork_size, get_preferred_artwork_size, get_target_size_match_mode, get_deep_scan_all_files, get_scan_worker_threads, get_max_candidates_per_album, get_batch_search_count, get_max_embedded_artwork_size, get_nas_worker_enabled
 from .utils import clean_input_path, open_path, normalize_for_match, clean_album_name, artwork_meets_target_size, prepare_jpeg_bytes, image_dimensions_from_bytes
-from .scanner import scan_library, write_low_res_csv, count_album_folders, embedded_artwork, inspect_album_identity, analyze_album_folder, _album_folder_cover_status, deep_check_album_problem_files, _deep_check_album_files
+from .scanner import scan_library, write_low_res_csv, count_album_folders, embedded_artwork, inspect_album_identity, analyze_album_folder, _album_folder_cover_status, deep_check_album_problem_files, _deep_check_album_files, album_music_relpaths
 from .review_queue import build_candidates, google_images_url, manual_import
 from .embedder import embed_album, archive_approved, save_approved_artwork_to_album_folder, undo_last_embed, iter_music_files, list_embed_backups, restore_embed_history
 from .state import evaluate_album_state, evaluate_album_record, workflow_bucket_for_status, good_reason_from_notes, needs_convert_reason, folder_cover_required, album_has_not_square_artwork, not_square_reason, effective_deep_file_check, deep_check_resolved_note
@@ -1303,7 +1303,9 @@ class ImagePreviewWindow(tk.Toplevel):
                 original = img.convert('RGBA') if img.mode not in ('RGB', 'RGBA') else img.copy()
                 self.after(0, lambda: self._image_loaded(token, original, size_text))
             except Exception as exc:
-                self.after(0, lambda: self._image_failed(token, exc))
+                # Bind exc now: Python deletes it when the except block ends,
+                # so a late-running lambda would otherwise raise NameError.
+                self.after(0, lambda err=exc: self._image_failed(token, err))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -7345,12 +7347,10 @@ class App:
         return folders
 
     def _local_deep_check_result(self, album_path, target_size, *, problem_files=False):
-        names = []
         try:
-            names = sorted(os.listdir(album_path), key=lambda x: x.lower())
+            music = album_music_relpaths(album_path)
         except Exception:
-            names = []
-        music = [n for n in names if os.path.isfile(os.path.join(album_path, n)) and n.lower().endswith(('.mp3', '.flac', '.m4a', '.mp4'))]
+            music = []
         deep = _deep_check_album_files(album_path, music, target_size)
         deep['source'] = 'mac-local'
         rows = deep_check_album_problem_files(album_path, target_size=target_size, limit=500) if problem_files else []

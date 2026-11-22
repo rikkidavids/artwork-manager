@@ -28,6 +28,21 @@ def _sort_names(names):
         return list(names)
 
 
+def album_music_relpaths(album_path):
+    """Return every supported music file in an album, relative to its folder.
+
+    Embedding walks disc subfolders (e.g. Album/CD1, Album/CD2), so checks and
+    verification must cover the same files or multi-disc albums can never pass.
+    """
+    out = []
+    for root, dirs, files in os.walk(album_path):
+        dirs[:] = _sort_names(d for d in dirs if not d.startswith('.'))
+        for fn in _sort_names(files):
+            if fn.lower().endswith(MUSIC_EXTENSIONS) and not fn.startswith('._'):
+                out.append(os.path.relpath(os.path.join(root, fn), album_path))
+    return out
+
+
 def _path_resume_key(path):
     try:
         return os.path.normcase(os.path.abspath(os.path.normpath(str(path or ''))))
@@ -521,10 +536,9 @@ def deep_check_album_problem_files(root, target_size=None, limit=200):
     to see which tracks are holding the album back.
     """
     try:
-        names = _sort_names(os.listdir(root))
+        music = album_music_relpaths(root)
     except Exception:
         return []
-    music = [n for n in names if os.path.isfile(os.path.join(root, n)) and n.lower().endswith(MUSIC_EXTENSIONS)]
     try:
         target = int(target_size or get_preferred_artwork_size())
     except Exception:

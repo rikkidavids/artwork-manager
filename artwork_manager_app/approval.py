@@ -11,7 +11,7 @@ from . import database as db
 from .config import get_max_embedded_artwork_size, get_preferred_artwork_size, load_settings
 from .embedder import embed_album, iter_music_files, save_approved_artwork_to_album_folder
 from .remote_worker import deep_check_album_remote, embed_album_remote, worker_enabled_for_path
-from .scanner import _album_folder_cover_status, _deep_check_album_files, deep_check_album_problem_files, embedded_artwork
+from .scanner import _album_folder_cover_status, _deep_check_album_files, album_music_relpaths, deep_check_album_problem_files, embedded_artwork
 from .state import deep_check_resolved_note, workflow_bucket_for_status
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -173,10 +173,9 @@ def _deep_check_summary_text(deep: Dict[str, Any], settings: Optional[Dict[str, 
 
 def _local_deep_check_result(album_path: str, target_size: int, *, problem_files: bool = False) -> Dict[str, Any]:
     try:
-        names = sorted(os.listdir(album_path), key=lambda item: item.lower())
+        music = album_music_relpaths(album_path)
     except Exception:
-        names = []
-    music = [n for n in names if os.path.isfile(os.path.join(album_path, n)) and n.lower().endswith(('.mp3', '.flac', '.m4a', '.mp4'))]
+        music = []
     deep = _deep_check_album_files(album_path, music, target_size)
     deep['source'] = 'mac-local'
     rows = deep_check_album_problem_files(album_path, target_size=target_size, limit=500) if problem_files else []

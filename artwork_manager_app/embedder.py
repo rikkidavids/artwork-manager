@@ -12,16 +12,36 @@ from . import database as db
 
 
 def iter_music_files(album_folder):
-    for root,_,files in os.walk(album_folder):
-        for fn in files:
+    for root,dirs,files in os.walk(album_folder):
+        dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
+        for fn in sorted(files):
+            # Skip macOS AppleDouble sidecars (._01.flac) left on NAS/USB volumes.
+            if fn.startswith('._'):
+                continue
             if fn.lower().endswith(MUSIC_EXTENSIONS): yield os.path.join(root,fn)
 
-def backup_file(file_path, album_key):
-    stamp=datetime.now().strftime('%Y%m%d_%H%M%S')
+def backup_file(file_path, album_key, album_folder=None, stamp=None):
+    """Copy a music file into the backup area before it is rewritten.
+
+    The file's path relative to the album folder is preserved, so multi-disc
+    albums (CD1/01.flac and CD2/01.flac) get separate backups. Pass the same
+    ``stamp`` for every file in one embed so they share one backup folder.
+    """
+    stamp=stamp or datetime.now().strftime('%Y%m%d_%H%M%S')
     safe=sanitize_filename(album_key)[:120]
     dest_dir=BACKUP_DIR / safe / stamp
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest=dest_dir / Path(file_path).name
+    rel=Path(file_path).name
+    if album_folder:
+        try:
+            candidate=Path(os.path.relpath(file_path, album_folder))
+            if not candidate.is_absolute() and '..' not in candidate.parts:
+                rel=candidate
+        except ValueError:
+            pass
+    dest=dest_dir / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        raise FileExistsError(f'Backup already exists, refusing to overwrite: {dest}')
     shutil.copy2(file_path, dest)
     return str(dest)
 
@@ -76,6 +96,9 @@ def embed_album(album_folder, image_path, album_key, backup=True, progress=None,
         }
         db.add_history(album_key, 'embed_blocked', payload)
         return payload
+    # One shared folder per embed. Microseconds keep two quick embeds of the
+    # same album (e.g. an approve then a retry) from colliding.
+    backup_stamp=datetime.now().strftime('%Y%m%d_%H%M%S_%f')
     for idx, fp in enumerate(files, 1):
         if stop_event is not None and stop_event.is_set():
             failed.append({'file':fp,'error':'Embedding cancelled before this file was updated'})
@@ -85,7 +108,7 @@ def embed_album(album_folder, image_path, album_key, backup=True, progress=None,
             continue
         try:
             b=None
-            if backup: b=backup_file(fp, album_key); backups.append({'file':fp,'backup':b})
+            if backup: b=backup_file(fp, album_key, album_folder=album_folder, stamp=backup_stamp); backups.append({'file':fp,'backup':b})
             if embed_file(fp, image_bytes, mime): updated+=1
         except Exception as exc:
             failed.append({'file':fp,'error':str(exc)})
@@ -163,6 +186,12 @@ def list_embed_backups(limit=500):
         except Exception:
             payload = {}
         backups = payload.get('backups') or []
+        backup_dir = ''
+        try:
+            parents = [str(Path(b.get('backup')).parent) for b in backups if b.get('backup')]
+            backup_dir = os.path.commonpath(parents) if parents else ''
+        except Exception:
+            backup_dir = ''
         out.append({
             'history_id': row.get('id'),
             'album_key': row.get('album_key'),
@@ -172,7 +201,7 @@ def list_embed_backups(limit=500):
             'updated': payload.get('updated') or 0,
             'failed_count': len(payload.get('failed') or []),
             'backup_count': len(backups),
-            'backup_dir': str(Path(backups[0].get('backup')).parent) if backups and backups[0].get('backup') else '',
+            'backup_dir': backup_dir,
         })
     return out
 
